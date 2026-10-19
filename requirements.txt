@@ -1,0 +1,9 @@
+# 必須
+discord.py[voice]
+requests
+
+# 使うエンジンに応じて（Windows）
+pyvcroid2; sys_platform == "win32"          # VOICEROID2
+aivoice_python; sys_platform == "win32"     # A.I.VOICE
+pywin32; sys_platform == "win32"            # CeVIO
+# VOICEVOX は requests だけで動きます（エンジンを起動しておく）
