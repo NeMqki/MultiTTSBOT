@@ -1,0 +1,30 @@
+# 秘密情報・個人の設定
+token.txt
+token_*.txt
+config.txt
+config_*.txt
+!config.example.txt
+.env
+
+# BOTが作るデータ（ユーザーID・サーバーIDが入っています）
+user_settings.json
+guild_settings.json
+dictionary.json
+sessions.json
+presence.json
+*.json.bak-*
+*.json.corrupt
+*.json.tmp
+data_*/
+
+# ログ・一時ファイル
+logs/
+tmp/
+*.wav
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
