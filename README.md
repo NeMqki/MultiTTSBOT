@@ -1,0 +1,2 @@
+# MultiTTSBOT
+A.I.VOICEやVoiceroid2、VOICEVOXやCeVIOのエンジンを使ってDiscordの読み上げをするbot
