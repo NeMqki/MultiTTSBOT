@@ -1,0 +1,124 @@
+# MultiTTSBOT 設定ファイル
+# 「#」で始まる行はコメントです。書き換えたらBOTを再起動してください。
+# ※BOTトークンはここではなく token.txt に書きます（このファイルを人に見せても安全にするため）
+
+[bot]
+# トークンを書いたファイル名（BOTごとに分けたいときに変更）
+token_file = token.txt
+
+# 設定・辞書・一時ファイルの保存先。空ならこのスクリプトのフォルダ。
+# BOTを複数動かすときは、BOTごとに別の場所を指定してください（例: data_bot2）
+data_dir =
+
+# 管理者（/restart /presence が使える人）のユーザーID。カンマ区切り（例: 123456789012345678, 234567890123456789）
+owner_ids =
+
+# 使うエンジン。使わないものは消す（起動が速く軽くなります）
+# 選べる値: roid, aivoice, voicevox, cevio
+engines = roid, aivoice, voicevox, cevio
+
+# BOTを再起動したあと（クラッシュ後を含む）、接続していたVCに自動で戻る
+# /leave で切断したサーバーや、無人になって抜けたサーバーには戻りません
+auto_resume = on
+
+
+[engine]
+voicevox_host = http://127.0.0.1:50021
+
+# 通常は空でOK（インストール先が特殊な場合だけ指定）
+voiceroid_install_path =
+voiceroid_install_path_x86 =
+aivoice_editor_dir =
+
+# 同じエンジン（VOICEROID2 / A.I.VOICE / CeVIO）を、複数のBOTで共有するときの設定
+# on にすると、別のBOTが合成中ならそれが終わるまで待ってから読み上げます（BOTが1つだけなら影響なし）
+shared_lock = on
+# 他のBOTを待つ最大秒数（超えるとその発言は読み飛ばされます）
+lock_timeout_seconds = 120
+# BOT終了時にCeVIO本体も閉じるか。共有しているときは off のままにしてください
+# （on にすると、先に終了したBOTがCeVIOを閉じて、もう片方のBOTが読み上げられなくなります）
+cevio_close_host = off
+
+# 起動に失敗した・途中で落ちたエンジンに、自動で再接続を試みる（VOICEVOXを後から起動した場合など）
+# 失敗が続くと、試す間隔を少しずつ延ばします（最大5分）。VOICEROID2は動作中の再接続をしません
+auto_reconnect = on
+# 最初に再接続を試すまでの秒数
+reconnect_interval_seconds = 60
+# 読み上げが連続でこの回数失敗したら、読み上げチャンネルに知らせる（再接続の対象にもなる）
+fail_notice_threshold = 3
+# 同じエンジンの通知を、この秒数のあいだはくり返さない
+fail_notice_cooldown_seconds = 600
+
+
+[voice]
+# 話者を設定していないユーザーに、自動で割り当てる声の候補エンジン（カンマ区切り）
+# 最初に発言したときにランダムで1つ決まり、その後はずっと同じ声になります
+# （本人が /voice で選べば、そちらが優先されます）
+# 選べる値: roid, aivoice, voicevox, cevio
+random_engines = aivoice, roid
+
+
+[limits]
+# 1サーバーあたりの読み上げ待ちの上限（超えた分は捨てる）
+max_queue = 20
+# 待ちがあふれて読み飛ばしたとき、読み上げチャンネルに知らせる。同じ通知をくり返さない秒数
+overflow_notice_seconds = 60
+# 1発言で読む最大文字数（超えたら「以下略」）
+max_text_len = 300
+# 名前読み上げON時、同じ人の連続発言で名前を省略する秒数
+name_repeat_seconds = 60
+# /voices の1ページあたりの表示数
+voices_per_page = 10
+# 辞書の登録上限と、1語あたりの最大文字数
+dict_max_entries = 500
+dict_max_word = 30
+dict_max_reading = 60
+
+
+[reading]
+# この文字で始まる発言は読み上げない（カンマ区切り）
+skip_prefixes = ;, ；, //, /
+
+# 初めて使うサーバーでの初期値（on / off）。サーバーごとに /readname /announce で変更できます
+# 発言者の名前を読み上げる
+default_read_name = off
+# VCの入退室を読み上げる
+default_announce = off
+
+# 画像などの添付ファイルだけの発言は「添付ファイル」と読みます。
+# スタンプや絵文字（カスタム絵文字・通常の絵文字）は読みません。
+
+
+[presence]
+# BOTの「プレイ中」表示を、読み上げ中のサーバー数で自動更新する
+# /presence で文字を指定すると、自動表示はオフになります（/presence auto:True で戻せます）
+auto = on
+# 読み上げ中のサーバーがあるときの表示。{n} がサーバー数になります
+auto_active = {n}サーバーで読み上げ中
+# 読み上げ中のサーバーがないときの表示（空にすると何も表示しません）
+auto_idle = /join で読み上げ開始
+
+
+[log]
+# ログをファイルにも保存する（保存先: data_dir の中の logs フォルダ）
+file = on
+# 1ファイルの最大サイズ（MB）と、残す古いファイルの数
+max_size_mb = 2
+backups = 5
+# 記録する詳しさ: DEBUG / INFO / WARNING / ERROR
+level = INFO
+# ログには、エラーの内容やBOTの動作が記録されます（発言の内容は記録しません。
+# ただしエラーの種類によっては、エンジンのエラーメッセージに一部含まれることがあります）
+
+
+[voiceroid_names]
+# VOICEROID2の話者名。「内部名 = 表示名」の形で書く
+# 新しいボイスを入れたときは、ここに1行足すだけで日本語名になります
+ai_44 = 月読アイ
+itako_emo_44 = 東北イタコ
+kiritan_44 = 東北きりたん
+seika_44 = 京町セイカ
+sora_44 = 桜乃そら
+tsuina_44 = ついなちゃん
+tsuina_west_44 = ついなちゃん（関西弁）
+zunko_44 = 東北ずん子
