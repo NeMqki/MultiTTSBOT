@@ -10,7 +10,7 @@ token_file = token.txt
 # BOTを複数動かすときは、BOTごとに別の場所を指定してください（例: data_bot2）
 data_dir =
 
-# 管理者（/restart /presence が使える人）のユーザーID。カンマ区切り（例: 123456789012345678, 234567890123456789）
+# 管理者（/restart /presence が使える人）のユーザーID。カンマ区切り
 owner_ids =
 
 # 使うエンジン。使わないものは消す（起動が速く軽くなります）
@@ -20,6 +20,11 @@ engines = roid, aivoice, voicevox, cevio
 # BOTを再起動したあと（クラッシュ後を含む）、接続していたVCに自動で戻る
 # /leave で切断したサーバーや、無人になって抜けたサーバーには戻りません
 auto_resume = on
+
+# 通信の不具合などでVCから切断されたとき、同じVCに自動で入り直す（5秒・15秒・30秒後に最大3回）
+# /leave で抜けたとき・無人になって抜けたときは戻りません
+# ※管理者が手動でBOTをVCから切断したときも、人がいれば入り直します。それが困るなら off に
+auto_rejoin = on
 
 
 [engine]
