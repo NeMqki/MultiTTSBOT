@@ -114,6 +114,9 @@ _enabled = set(cfg_list("bot", "engines")) or set(ENGINE_ORDER)
 ENABLED_ENGINES = [k for k in ENGINE_ORDER if k in _enabled]
 # BOTの再起動・クラッシュのあと、接続していたVCに自動で戻る
 AUTO_RESUME = cfg_bool("bot", "auto_resume", True)
+# 通信の不具合などでVCから切断されたとき、同じVCに自動で入り直す（/leave や無人で抜けたときは戻らない）
+AUTO_REJOIN = cfg_bool("bot", "auto_rejoin", True)
+REJOIN_DELAYS = (5, 15, 30)   # 入り直しを試すまでの待ち秒数（この回数まで試して、だめなら止める）
 
 # --- [engine] ---
 VOICEROID_INSTALL_PATH = cfg_str("engine", "voiceroid_install_path") or None
@@ -1439,6 +1442,7 @@ class TTSBot(discord.Client):
         self._last_presence = (status, kind, text)
         self._tasks: list[asyncio.Task] = []
         self.retry_state: dict[str, dict] = {}      # エンジンごとの再接続の待ち時間
+        self._rejoining: set[int] = set()           # 入り直しの最中のサーバー
 
     async def setup_hook(self):
         for f in TEMP_DIR.glob("*.wav"):   # 前回の消し残しを掃除
@@ -1568,6 +1572,42 @@ class TTSBot(discord.Client):
                     sessions_store.save()
             await asyncio.sleep(1)
 
+    # ---- 切断されたときの入り直し ----
+    async def rejoin(self, guild: discord.Guild, vc_id: int, text_id: int):
+        if guild.id in self._rejoining:
+            return
+        self._rejoining.add(guild.id)
+        try:
+            for wait in REJOIN_DELAYS:
+                await asyncio.sleep(wait)
+                if self._closing:
+                    return
+                player = players.get(guild.id)
+                if player is not None and player.active:
+                    return   # すでに戻っている（/join された、など）
+                vc_ch = guild.get_channel(vc_id)
+                if not isinstance(vc_ch, (discord.VoiceChannel, discord.StageChannel)) \
+                        or not any(not m.bot for m in vc_ch.members):
+                    return   # VCが無い・無人なら戻らない
+                try:
+                    await get_player(guild).connect(vc_ch, text_id)
+                except Exception as e:
+                    log.warning("VCへの入り直しに失敗: guild=%s (%s)", guild.id, e)
+                    continue
+                log.info("切断されたため、VCに入り直しました: guild=%s", guild.id)
+                ch = guild.get_channel_or_thread(text_id)
+                if ch is not None:
+                    with contextlib.suppress(Exception):
+                        await ch.send("接続が切れたため、読み上げを再開しました")
+                return
+            log.error("VCへの入り直しをあきらめました: guild=%s", guild.id)
+            ch = guild.get_channel_or_thread(text_id)
+            if ch is not None:
+                with contextlib.suppress(Exception):
+                    await ch.send("⚠ VCとの接続が切れて、戻れませんでした。/join でもう一度接続してください")
+        finally:
+            self._rejoining.discard(guild.id)
+
     async def close(self):
         if not self._cleaned_up:
             self._cleaned_up = True
@@ -1645,7 +1685,13 @@ async def on_voice_state_update(member: discord.Member, before, after):
 
     if member.id == bot.user.id:
         if after.channel is None:
-            await player.shutdown()   # 強制切断された場合は状態を片付ける
+            # /leave や無人での退出は、先に voice_client を外すので、ここには来ない。
+            # ここに来るのは、通信の不具合や、手動で切断されたとき
+            vc_id, text_id = player.voice_channel_id, player.text_channel_id
+            await player.shutdown()   # 状態を片付ける
+            if AUTO_REJOIN and vc_id is not None and text_id is not None:
+                log.warning("VCから切断されました: guild=%s → 入り直します", member.guild.id)
+                spawn(bot.rejoin(member.guild, vc_id, text_id))
         elif player.voice_channel_id != after.channel.id:
             player.voice_channel_id = after.channel.id   # 別のVCへ移動させられた場合は、記録も更新
             player._save_session()
