@@ -10,8 +10,18 @@ token_file = token.txt
 # BOTを複数動かすときは、BOTごとに別の場所を指定してください（例: data_bot2）
 data_dir =
 
+# ユーザー設定（user_settings.json）と辞書（dictionary.json）を置く場所。空なら data_dir
+# BOTを2つ動かすとき、両方で同じフォルダを指定すると、話者・速度・辞書が共有されます
+shared_dir =
+
 # 管理者（/restart /presence が使える人）のユーザーID。カンマ区切り
 owner_ids =
+
+# 入っていてよいサーバーのID（カンマ区切り）。書くと、それ以外のサーバーからは自動で抜けます
+# 空なら制限なし（どのサーバーにもいられる）
+allowed_guilds =
+# 許可リストにないサーバーから抜ける前に送るメッセージ（\n で改行。空にすると何も送らずに抜けます）
+leave_message = このBOTは決まったサーバーだけで使っているため、このサーバーから退出します。
 
 # 使うエンジン。使わないものは消す（起動が速く軽くなります）
 # 選べる値: roid, aivoice, voicevox, cevio
@@ -112,6 +122,10 @@ max_size_mb = 2
 backups = 5
 # 記録する詳しさ: DEBUG / INFO / WARNING / ERROR
 level = INFO
+# 読み上げた発言が、どのサーバー・チャンネル・誰のものかをログに残す
+log_reads = on
+# 上に加えて、読み上げた文章そのものもログに残す（調べるときだけ on に。普段は off）
+log_read_text = off
 # ログには、エラーの内容やBOTの動作が記録されます（発言の内容は記録しません。
 # ただしエラーの種類によっては、エンジンのエラーメッセージに一部含まれることがあります）
 

@@ -17,6 +17,7 @@ BOTを複数動かすとき:  python MultiTTSBOT.py config_bot2.txt
 import asyncio
 import configparser
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -97,9 +98,23 @@ DATA_DIR = _resolve(cfg_str("bot", "data_dir"))   # 空ならスクリプトの�
 TEMP_DIR = DATA_DIR / "tmp"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+# ユーザー設定と辞書を置く場所。BOT同士で同じ場所を指定すると共有になる（空なら data_dir）
+_shared = cfg_str("bot", "shared_dir")
+SHARED_DIR = _resolve(_shared) if _shared else DATA_DIR
+STORE_LOCK_TIMEOUT = 10   # 共有ファイルを、他のBOTが書き込み中のときに待つ最大秒数
+
+# 入っていてよいサーバーのID。書いてあると、それ以外のサーバーからは自動で抜ける（空なら制限なし）
+ALLOWED_GUILDS = {int(x) for x in cfg_list("bot", "allowed_guilds", "") if x.isdigit()}
+# 許可リストにないサーバーから抜ける前に送るメッセージ（空なら何も送らずに抜ける）。\n で改行
+LEAVE_MESSAGE = cfg_str(
+    "bot", "leave_message",
+    "このBOTは個人のプライベート向けに運用しているもので、こちらの設定ミスにより、"
+    "誰でも招待できる状態になっていました。\\n"
+    "申し訳ありませんが、このサーバーから退出します。ご迷惑をおかけしました。",
+).replace("\\n", "\n")
 
 OWNER_IDS = {
-    int(x) for x in cfg_list("bot", "owner_ids", "266447175695728640, 1193926853145145384")
+    int(x) for x in cfg_list("bot", "owner_ids", "")
     if x.isdigit()
 }
 
@@ -145,6 +160,10 @@ LOG_TO_FILE = cfg_bool("log", "file", True)
 LOG_MAX_MB = max(1, cfg_int("log", "max_size_mb", 2))
 LOG_BACKUPS = max(1, cfg_int("log", "backups", 5))
 LOG_LEVEL = cfg_str("log", "level", "INFO").upper()
+# 読み上げた発言を、どのサーバー・チャンネル・誰のものかログに残す（on/off）
+LOG_READS = cfg_bool("log", "log_reads", True)
+# 上に加えて、読み上げた文章そのものもログに残す（調べものをするときだけ on に。初期は off）
+LOG_READ_TEXT = cfg_bool("log", "log_read_text", False)
 
 # --- [limits] ---
 VOICES_PER_PAGE = cfg_int("limits", "voices_per_page", 10)
@@ -665,8 +684,8 @@ ENGINE_CLASSES = {
 class JsonStore:
     """壊れたら退避して続行 / 保存は一時ファイル経由で上書き（書き込み中の電源断に強い）"""
 
-    def __init__(self, filename: str):
-        self.path = DATA_DIR / filename
+    def __init__(self, filename: str, directory: Optional[Path] = None):
+        self.path = (directory or DATA_DIR) / filename
         self.data: dict = {}
         self._load()
 
@@ -686,30 +705,115 @@ class JsonStore:
                 os.replace(self.path, backup)
             self.data = {}
 
-    def save(self):
+    def _write(self):
         tmp = self.path.with_name(self.path.name + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, self.path)
+                return
+            except PermissionError:
+                # Windowsでは、ウイルス対策ソフトなどが一瞬ファイルを開いていると置き換えに失敗する
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
+
+    def save(self):
+        self._write()
 
 
-class UserSettings(JsonStore):
+class SharedStore(JsonStore):
+    """
+    複数のBOTで共有できる保存ファイル（ユーザー設定・辞書）。
+    - 他のBOTがファイルを書き換えたら、次に読むときに読み直す
+    - 書き込みは、BOT同士でロックを取ってから「最新を読み直す → 変更を加える → 保存」の順で行う
+      （どちらのBOTの変更も消えない）
+    BOTが1つだけでも、そのまま使える。
+    """
+
+    def __init__(self, filename: str, directory: Optional[Path] = None):
+        self.path = (directory or DATA_DIR) / filename
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.data: dict = {}
+        self._stamp = None
+        name = hashlib.md5(str(self.path.resolve()).lower().encode("utf-8")).hexdigest()[:16]
+        self._lock = CrossProcessLock(f"MultiTTSBOT_store_{name}")
+        with self._hold():
+            self._load()
+
+    def _hold(self):
+        return self._lock.hold(STORE_LOCK_TIMEOUT)
+
+    def _file_stamp(self):
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return None
+        # 保存のたびにファイルを置き換えるので、st_ino（ファイルの番号）も変わる。時刻が同じでも見分けられる
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+    def _load(self):
+        super()._load()
+        self._stamp = self._file_stamp()
+        self._on_reload()
+
+    def _on_reload(self):
+        pass
+
+    def refresh(self):
+        """他のBOTが書き換えていたら読み直す"""
+        if self._file_stamp() != self._stamp:
+            with self._hold():
+                self._load()
+
+    def mutate(self, fn):
+        """ロックを取り、最新を読み直してから fn(data) で変更し、保存する。fn の戻り値を返す"""
+        with self._hold():
+            if self._file_stamp() != self._stamp:
+                self._load()
+            result = fn(self.data)
+            self._write()
+            self._stamp = self._file_stamp()
+        return result
+
+    def save(self):
+        self.mutate(lambda d: None)
+
+
+class UserSettings(SharedStore):
     # auto: 未設定だったので自動で割り当てた話者（/voice で選ぶと False になる）
     DEFAULTS = {"engine": None, "voice": None, "auto": False, "speed": 1.0, "pitch": 1.0}
 
     def get(self, user_id: int) -> dict:
+        self.refresh()
         s = self.data.setdefault(str(user_id), {})
         for k, v in self.DEFAULTS.items():
             s.setdefault(k, v)
         return s
 
     def update(self, user_id: int, **kwargs):
-        s = self.get(user_id)
-        s.update(kwargs)
-        if "voice" in kwargs:   # 旧形式（番号保存）の値は捨てる
-            s.pop("voice_index", None)
-            s.pop("unified_index", None)
-        self.save()
+        def fn(d):
+            s = d.setdefault(str(user_id), {})
+            s.update(kwargs)
+            if "voice" in kwargs:   # 旧形式（番号保存）の値は捨てる
+                s.pop("voice_index", None)
+                s.pop("unified_index", None)
+        self.mutate(fn)
+
+    def assign_auto(self, user_id: int, seen: tuple, engine: str, voice: str) -> tuple:
+        """
+        自動割り当ての話者を保存する。ただし、見たときから他のBOTが先に決めていたら、そちらを残す
+        （2つのBOTで同時に初発言しても、声が食い違わないように）。保存されている (engine, voice) を返す
+        """
+        def fn(d):
+            s = d.setdefault(str(user_id), {})
+            if (s.get("engine"), s.get("voice")) == seen:
+                s.update(engine=engine, voice=voice, auto=True)
+                s.pop("voice_index", None)
+                s.pop("unified_index", None)
+            return s.get("engine"), s.get("voice")
+        return self.mutate(fn)
 
 
 class GuildSettings(JsonStore):
@@ -741,29 +845,37 @@ def validate_dict_word(word: str) -> Optional[str]:
     return None
 
 
-class Dictionary(JsonStore):
-    def __init__(self, filename: str):
-        super().__init__(filename)
+class Dictionary(SharedStore):
+    def __init__(self, filename: str, directory: Optional[Path] = None):
         self._cache: dict[str, tuple] = {}
+        super().__init__(filename, directory)
+
+    def _on_reload(self):
+        self._cache.clear()   # 他のBOTが辞書を変えたら、置換ルールを作り直す
 
     def get_map(self, guild_id: int) -> dict[str, str]:
+        self.refresh()
         return self.data.get(str(guild_id), {})
 
     def add(self, guild_id: int, word: str, reading: str):
-        self.data.setdefault(str(guild_id), {})[word] = reading
+        def fn(d):
+            d.setdefault(str(guild_id), {})[word] = reading
+        self.mutate(fn)
         self._cache.pop(str(guild_id), None)
-        self.save()
 
     def remove(self, guild_id: int, word: str) -> bool:
-        m = self.data.get(str(guild_id), {})
-        if word in m:
-            del m[word]
-            self._cache.pop(str(guild_id), None)
-            self.save()
-            return True
-        return False
+        def fn(d):
+            m = d.get(str(guild_id), {})
+            if word in m:
+                del m[word]
+                return True
+            return False
+        removed = self.mutate(fn)
+        self._cache.pop(str(guild_id), None)
+        return removed
 
     def _compiled(self, guild_id: int):
+        self.refresh()
         key = str(guild_id)
         hit = self._cache.get(key)
         if hit is not None:
@@ -798,9 +910,9 @@ class Dictionary(JsonStore):
 # ====================== グローバル状態 ======================
 engines: dict[str, TTSEngine] = {}
 players: dict[int, "GuildPlayer"] = {}
-settings = UserSettings(SETTINGS_FILE)
-guild_settings = GuildSettings(GUILD_SETTINGS_FILE)
-dictionary = Dictionary(DICT_FILE)
+settings = UserSettings(SETTINGS_FILE, SHARED_DIR)       # ユーザー設定（shared_dir を指定するとBOT同士で共有）
+guild_settings = GuildSettings(GUILD_SETTINGS_FILE)      # サーバー設定（BOTごと）
+dictionary = Dictionary(DICT_FILE, SHARED_DIR)           # 辞書（shared_dir を指定するとBOT同士で共有）
 presence_store = JsonStore("presence.json")   # BOTのステータス・プレイ中表示（再起動後も保持）
 sessions_store = JsonStore("sessions.json")   # 接続中のVC（再起動後に自動で戻るため）
 RESTART_REQUESTED = False
@@ -938,7 +1050,18 @@ def auto_assign(user_id: int, persist: bool) -> tuple[TTSEngine, Voice]:
         return default_choice()
     if persist:
         eng, v = random.choice(pool)
-        settings.update(user_id, engine=eng.name, voice=v.key, auto=True)
+        s = settings.get(user_id)
+        seen = (s.get("engine"), s.get("voice"))
+        try:
+            got_eng, got_voice = settings.assign_auto(user_id, seen, eng.name, v.key)
+        except (OSError, TimeoutError):
+            log.exception("自動割り当ての保存に失敗（今回だけこの声で読みます）")
+            return eng, v
+        if (got_eng, got_voice) != (eng.name, v.key):
+            # 他のBOTが先に決めていた → そちらの声を使う（このBOTで使えなければ今回だけ代役）
+            other = engines.get(got_eng)
+            ov = other.find_voice(got_voice) if other else None
+            return (other, ov) if ov is not None else random.Random(user_id).choice(pool)
         log.info("話者を自動割り当て: user=%s → [%s] %s", user_id, eng.display_name, v.label)
         return eng, v
     return random.Random(user_id).choice(pool)
@@ -961,41 +1084,53 @@ def migrate_legacy_settings() -> int:
     今の声のまま固定する（ランダムに振り直さない）。稼働中のエンジンの分だけ変換し、
     止まっているエンジンの分は、そのエンジンが使えるようになってからの次の機会に変換する。
     """
-    targets = []
-    for uid, s in settings.data.items():
-        if not isinstance(s, dict) or s.get("voice") is not None:
-            continue
-        if "voice_index" not in s:
-            continue
-        eng = engines.get(s.get("engine") or "roid")
-        if eng is None:
-            continue
-        v = _legacy_voice(eng, s.get("voice_index"))
-        if v is not None:
-            targets.append((uid, s, eng, v))
-        elif uid not in _migration_warned:
-            # 番号が範囲外など。推測で割り当てず、そのまま残す
-            _migration_warned.add(uid)
-            log.warning("移行できません（番号が範囲外）: user=%s engine=%s voice_index=%r → そのまま残します",
-                        uid, eng.name, s.get("voice_index"))
-    if not targets:
+    def plan(data: dict, warn: bool) -> list:
+        targets = []
+        for uid, s in data.items():
+            if not isinstance(s, dict) or s.get("voice") is not None:
+                continue
+            if "voice_index" not in s:
+                continue
+            eng = engines.get(s.get("engine") or "roid")
+            if eng is None:
+                continue
+            v = _legacy_voice(eng, s.get("voice_index"))
+            if v is not None:
+                targets.append((uid, eng, v))
+            elif warn and uid not in _migration_warned:
+                # 番号が範囲外など。推測で割り当てず、そのまま残す
+                _migration_warned.add(uid)
+                log.warning("移行できません（番号が範囲外）: user=%s engine=%s voice_index=%r → そのまま残します",
+                            uid, eng.name, s.get("voice_index"))
+        return targets
+
+    settings.refresh()
+    if not plan(settings.data, warn=True):
         return 0
     backup = settings.path.with_name(settings.path.name + ".bak-before-migration")
     if settings.path.exists() and not backup.exists():
         with contextlib.suppress(OSError):
             shutil.copy2(settings.path, backup)
             log.info("移行前の設定を %s に保存しました", backup.name)
-    for uid, s, eng, v in targets:
-        s["engine"], s["voice"], s["auto"] = eng.name, v.key, False
-        s.pop("voice_index", None)
-        s.pop("unified_index", None)
+
+    def apply(d: dict) -> int:
+        # ロックを取ったあとの最新の内容で、もう一度対象を決め直す（他のBOTが先に移行していれば何もしない）
+        targets = plan(d, warn=False)
+        for uid, eng, v in targets:
+            s = d[uid]
+            s["engine"], s["voice"], s["auto"] = eng.name, v.key, False
+            s.pop("voice_index", None)
+            s.pop("unified_index", None)
+        return len(targets)
+
     try:
-        settings.save()
-    except OSError:
+        n = settings.mutate(apply)
+    except (OSError, TimeoutError):
         log.exception("設定の移行結果の保存に失敗")
         return 0
-    log.info("旧形式の話者設定を %d人分、話者名の形式に移行しました", len(targets))
-    return len(targets)
+    if n:
+        log.info("旧形式の話者設定を %d人分、話者名の形式に移行しました", n)
+    return n
 
 
 def resolve_user_voice(user_id: int) -> tuple[TTSEngine, Voice]:
@@ -1035,6 +1170,10 @@ class Utterance:
 def _remove_quietly(path: str):
     with contextlib.suppress(OSError):
         os.remove(path)
+    # A.I.VOICE は、音声と一緒に同じ名前の .txt も保存することがある（Editorの設定）。一緒に消す
+    if path.endswith(".wav"):
+        with contextlib.suppress(OSError):
+            os.remove(path[:-4] + ".txt")
 
 
 class GuildPlayer:
@@ -1445,8 +1584,9 @@ class TTSBot(discord.Client):
         self._rejoining: set[int] = set()           # 入り直しの最中のサーバー
 
     async def setup_hook(self):
-        for f in TEMP_DIR.glob("*.wav"):   # 前回の消し残しを掃除
-            _remove_quietly(str(f))
+        for f in TEMP_DIR.iterdir():   # 前回の消し残し（音声と、A.I.VOICE が一緒に作る .txt）を掃除
+            if f.is_file() and f.suffix.lower() in (".wav", ".txt"):
+                _remove_quietly(str(f))
 
         for key in ENABLED_ENGINES:
             eng = ENGINE_CLASSES[key]()
@@ -1628,10 +1768,65 @@ bot = TTSBot()
 @bot.event
 async def on_ready():
     log.info("ログイン完了: %s", bot.user)
+    log.info("参加しているサーバー: %d", len(bot.guilds))
+    for g in bot.guilds:
+        mark = "" if not ALLOWED_GUILDS or g.id in ALLOWED_GUILDS else "  ← 許可リストにないので抜けます"
+        log.info("  ・%s（id=%s、%s人）%s", g.name, g.id, g.member_count, mark)
+    for g in list(bot.guilds):
+        await leave_if_not_allowed(g)
     if not bot._restored:   # on_ready は再接続のたびに呼ばれるので、復帰は1回だけ
         bot._restored = True
         if AUTO_RESUME and sessions_store.data:
             spawn(bot.restore_sessions())
+
+
+async def _send_leave_message(guild: discord.Guild):
+    """抜ける前のひとことを、送れるチャンネルに1回だけ送る（システムチャンネル → 送れる最初のテキストチャンネル）"""
+    me = guild.me
+    candidates = []
+    if guild.system_channel is not None:
+        candidates.append(guild.system_channel)
+    candidates += sorted(guild.text_channels, key=lambda c: c.position)
+    for ch in candidates:
+        try:
+            if me is not None and not ch.permissions_for(me).send_messages:
+                continue
+            await ch.send(LEAVE_MESSAGE)
+            log.info("退出のお知らせを送りました: %s #%s", guild.name, ch.name)
+            return
+        except Exception:
+            continue
+    log.info("退出のお知らせを送れるチャンネルがありませんでした: %s", guild.name)
+
+
+async def leave_if_not_allowed(guild: discord.Guild) -> bool:
+    """許可リスト（allowed_guilds）にないサーバーから抜ける。抜けたら True"""
+    if not ALLOWED_GUILDS or guild.id in ALLOWED_GUILDS:
+        return False
+    player = players.pop(guild.id, None)
+    if player is not None:
+        with contextlib.suppress(Exception):
+            await player.shutdown()
+    if LEAVE_MESSAGE:
+        await _send_leave_message(guild)
+    try:
+        await guild.leave()
+        log.warning("許可リストにないサーバーから抜けました: %s（id=%s）", guild.name, guild.id)
+        return True
+    except Exception:
+        log.exception("サーバーから抜けられませんでした: %s（id=%s）", guild.name, guild.id)
+        return False
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    log.warning("サーバーに追加されました: %s（id=%s、%s人）", guild.name, guild.id, guild.member_count)
+    await leave_if_not_allowed(guild)
+
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    log.warning("サーバーから外れました: %s（id=%s）", guild.name, guild.id)
 
 
 @bot.event
@@ -1672,7 +1867,13 @@ async def on_message(message: discord.Message):
                 text = f"{name}、{text}"
         player.last_speaker = (message.author.id, now)
 
-    player.enqueue(make_utterance(text, message.author.id, message.id))
+    if player.enqueue(make_utterance(text, message.author.id, message.id)) and LOG_READS:
+        if LOG_READ_TEXT:
+            log.info("読み上げ: [%s] #%s %s（%s）: %s", message.guild.name, message.channel.name,
+                     message.author.display_name, message.author.id, text)
+        else:
+            log.info("読み上げ: [%s] #%s %s（%s）", message.guild.name, message.channel.name,
+                     message.author.display_name, message.author.id)
 
 
 @bot.event
@@ -1707,10 +1908,12 @@ async def on_voice_state_update(member: discord.Member, before, after):
     if not guild_settings.get(member.guild.id)["announce"] or not engines:
         return
     name = dictionary.apply(member.guild.id, strip_emoji(member.display_name)).strip() or "ユーザー"
+    # 入退室のアナウンスは、その人の声で読む（他のBOTの入退室は既定の声）
+    speaker = None if member.bot else member.id
     if after.channel == channel and before.channel != channel:
-        player.enqueue(make_utterance(f"{name}さんが入室しました", None))
+        player.enqueue(make_utterance(f"{name}さんが入室しました", speaker))
     elif before.channel == channel and after.channel != channel:
-        player.enqueue(make_utterance(f"{name}さんが退室しました", None))
+        player.enqueue(make_utterance(f"{name}さんが退室しました", speaker))
 
 
 # ====================== コマンド ======================
@@ -1737,6 +1940,9 @@ async def join(interaction: discord.Interaction):
         log.exception("VC接続に失敗")
         await interaction.followup.send("接続に失敗しました", ephemeral=True)
         return
+    log.info("/join: [%s] VC=%s 読み上げ=#%s 実行=%s（%s）", interaction.guild.name, vstate.channel.name,
+             getattr(interaction.channel, "name", interaction.channel_id),
+             interaction.user.display_name, interaction.user.id)
     await interaction.followup.send(f"**{vstate.channel.name}** に接続しました。このチャンネルの発言を読み上げます")
 
 
@@ -2128,6 +2334,10 @@ def main():
         raise
 
     if RESTART_REQUESTED:
+        if os.environ.get("MULTITTSBOT_LOOP") == "1":
+            # Start.bat のくり返し起動の中で動いている → 終了コード 3 で抜け、Start.bat にすぐ起動し直してもらう
+            # （ここで新しいプロセスも起動すると、BOTが2つ動いてしまう）
+            sys.exit(3)
         # os.execv はWindowsで挙動が不安定なので、新プロセスを起動してから終了する
         flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         subprocess.Popen([sys.executable, *sys.argv], creationflags=flags)

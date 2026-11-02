@@ -16,6 +16,9 @@ presence.json
 *.json.corrupt
 *.json.tmp
 data_*/
+shared/
+merge_report.txt
+*.bak-*
 
 # ログ・一時ファイル
 logs/
