@@ -50,6 +50,9 @@ aivoice_editor_dir =
 shared_lock = on
 # 他のBOTを待つ最大秒数（超えるとその発言は読み飛ばされます）
 lock_timeout_seconds = 120
+# エンジンが固まって応答しないとき、その発言をあきらめるまでの秒数（0 で無制限）
+# 順番待ちや、他のBOTを待つ時間は含みません
+synth_timeout_seconds = 60
 # BOT終了時にCeVIO本体も閉じるか。共有しているときは off のままにしてください
 # （on にすると、先に終了したBOTがCeVIOを閉じて、もう片方のBOTが読み上げられなくなります）
 cevio_close_host = off

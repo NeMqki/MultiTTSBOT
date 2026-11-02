@@ -141,6 +141,8 @@ VOICEVOX_HOST = cfg_str("engine", "voicevox_host", "http://127.0.0.1:50021")
 # 同じエンジンを複数のBOTで共有するとき、合成中は他のBOTを待たせる（VOICEROID2 / A.I.VOICE / CeVIO）
 ENGINE_SHARED_LOCK = cfg_bool("engine", "shared_lock", True)
 LOCK_TIMEOUT_SECONDS = cfg_int("engine", "lock_timeout_seconds", 120)
+SYNTH_TIMEOUT_SECONDS = cfg_int("engine", "synth_timeout_seconds", 60)   # 合成を待つ最大秒数（0 で無制限）
+RECONNECT_TIMEOUT_SECONDS = 180   # 再接続を待つ最大秒数（固まると、ほかのエンジンの再接続まで止まるので）
 # BOT終了時にCeVIO本体も閉じるか。他のBOTも使っている可能性があるので、既定ではオフ
 CEVIO_CLOSE_HOST = cfg_bool("engine", "cevio_close_host", False)
 # 起動に失敗した・途中で落ちたエンジンへ、自動で再接続を試みる
@@ -258,6 +260,10 @@ class CrossProcessLock:
 
 
 # ====================== TTSエンジン ======================
+class EngineHungError(RuntimeError):
+    """エンジンが固まって、応答を待つのをあきらめた"""
+
+
 class TTSEngine(ABC):
     """
     1エンジン = 専用の1スレッド。
@@ -269,6 +275,7 @@ class TTSEngine(ABC):
     display_name: str = "Engine"
     shared_lock: bool = False   # True のエンジンは、他のBOTと同時に触らないようロックする
     can_reconnect: bool = True  # False のエンジンは、動作中の再初期化（再接続）をしない
+    any_stuck: bool = False     # 固まったスレッドを1度でも残したか（普通の終了ができなくなる）
 
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tts-{self.name}")
@@ -276,6 +283,7 @@ class TTSEngine(ABC):
         self._by_key: dict[str, Voice] = {}
         self.fail_streak = 0                    # 連続で読み上げに失敗した回数
         self.last_error: Optional[str] = None   # 直近のエラー内容（/status で表示）
+        self._hung = asyncio.Event()            # 専用スレッドが固まっている間だけセットされる
         self._xlock = CrossProcessLock(f"MultiTTSBOT_{self.name}") if (self.shared_lock and ENGINE_SHARED_LOCK) else None
 
     async def _call(self, fn, *args):
@@ -289,31 +297,109 @@ class TTSEngine(ABC):
         with self._xlock.hold(LOCK_TIMEOUT_SECONDS):
             return fn(*args)
 
-    async def start(self):
-        await self._call(self._run_locked, self._setup)
+    @property
+    def hung(self) -> bool:
+        return self._hung.is_set()
+
+    def _mark_hung(self, fut, what: str):
+        """
+        固まった処理を見放す。スレッドは外から止められないので、処理が戻るまで新しい仕事は受けない。
+        戻ってきたら自動で復帰する（エンジンを再起動すると、固まっていた処理はエラーで戻る）。
+        """
+        self._hung.set()
+        TTSEngine.any_stuck = True
+        log.error("[%s] %sが応答しません。戻るまでこのエンジンは使えません", self.display_name, what)
+
+        def on_return(f):
+            self._hung.clear()
+            log.info("[%s] 固まっていた処理が戻りました", self.display_name)
+            if not f.cancelled() and f.exception() is None and isinstance(f.result(), str):
+                _remove_quietly(f.result())   # もう誰も待っていない音声は捨てる
+
+        fut.add_done_callback(on_return)
+
+    def _hung_error(self) -> EngineHungError:
+        return EngineHungError(f"{self.display_name} が固まっているため、読み上げられません")
+
+    async def start(self, timeout: Optional[int] = None):
+        fut = asyncio.get_running_loop().run_in_executor(self.executor, self._run_locked, self._setup)
+        try:
+            await asyncio.wait({fut}, timeout=timeout)
+        except asyncio.CancelledError:
+            fut.cancel()
+            raise
+        if not fut.done():
+            self._mark_hung(fut, "接続")
+            raise self._hung_error()
+        fut.result()
         self._by_key = {v.key: v for v in self.voices}
         self.fail_streak = 0
         self.last_error = None
 
     async def reconnect(self):
         """エンジンを初期化し直す（落ちていたエンジンが復活したときの再接続用）"""
-        await self.start()
+        if self.hung:
+            raise self._hung_error()   # 専用スレッドが空くまで、再接続もできない
+        await self.start(RECONNECT_TIMEOUT_SECONDS)
 
     async def synth(self, text: str, voice_key: str, speed: float, pitch: float) -> Optional[str]:
         """話者切替→合成を1つのまとまりとして専用スレッドで実行し、wavのパスを返す"""
         try:
-            path = await self._call(self._run_locked, self._synth, text, voice_key, speed, pitch)
+            path = await self._synth_guarded(text, voice_key, speed, pitch)
         except Exception as e:
             self.fail_streak += 1
+            if isinstance(e, EngineHungError):
+                self.fail_streak = max(self.fail_streak, FAIL_NOTICE_THRESHOLD)   # 1回でも、すぐ知らせて再接続を試す
             self.last_error = f"{type(e).__name__}: {e}"[:200]
             raise
         self.fail_streak = 0   # 成功したら数え直し（読み飛ばしの None も、エンジンは正常）
         return path
 
+    async def _synth_guarded(self, *args) -> Optional[str]:
+        """
+        固まったら SYNTH_TIMEOUT_SECONDS であきらめる。
+        数えるのは合成が始まってからで、順番待ちや、他のBOTを待つ時間は含まない。
+        """
+        if self.hung:
+            raise self._hung_error()
+        if SYNTH_TIMEOUT_SECONDS <= 0:
+            return await self._call(self._run_locked, self._synth, *args)
+
+        loop = asyncio.get_running_loop()
+        begun = asyncio.Event()
+
+        def job():
+            loop.call_soon_threadsafe(begun.set)
+            return self._synth(*args)
+
+        fut = loop.run_in_executor(self.executor, self._run_locked, job)
+        waits = {asyncio.ensure_future(begun.wait()), asyncio.ensure_future(self._hung.wait())}
+        try:
+            await asyncio.wait({fut, *waits}, return_when=asyncio.FIRST_COMPLETED)
+            if not fut.done() and begun.is_set():
+                await asyncio.wait({fut}, timeout=SYNTH_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            fut.cancel()
+            raise
+        finally:
+            for w in waits:
+                w.cancel()
+        if fut.done():
+            return fut.result()
+        if begun.is_set():
+            self._mark_hung(fut, f"合成（{SYNTH_TIMEOUT_SECONDS}秒）")
+        else:
+            fut.cancel()   # 順番待ちの間に、前の処理が固まった
+        raise self._hung_error()
+
     async def stop(self):
-        with contextlib.suppress(Exception):
-            await self._call(self._teardown)
-        self.executor.shutdown(wait=False)
+        if not self.hung:
+            fut = asyncio.get_running_loop().run_in_executor(self.executor, self._teardown)
+            with contextlib.suppress(Exception):
+                await asyncio.wait({fut}, timeout=10)
+                if not fut.done():
+                    self._mark_hung(fut, "終了処理")
+        self.executor.shutdown(wait=False, cancel_futures=True)
 
     def find_voice(self, key) -> Optional[Voice]:
         return self._by_key.get(key) if key is not None else None
@@ -1371,6 +1457,10 @@ class GuildPlayer:
                     wav = await utt.engine.synth(utt.text, utt.voice_key, utt.speed, utt.pitch)
             except asyncio.CancelledError:
                 raise
+            except EngineHungError as e:
+                log.warning("読み上げエラー（合成）: %s", e)   # 固まっている間は発言のたびに出るので、1行だけ
+                self._notify_engine_trouble(utt.engine)
+                wav = None
             except Exception:
                 log.exception("読み上げエラー（合成）")
                 self._notify_engine_trouble(utt.engine)
@@ -1661,7 +1751,7 @@ class TTSBot(discord.Client):
                     if eng is None:
                         new = ENGINE_CLASSES[key]()
                         try:
-                            await new.start()
+                            await new.start(RECONNECT_TIMEOUT_SECONDS)
                         except Exception:
                             new.executor.shutdown(wait=False)
                             raise
@@ -2171,6 +2261,8 @@ async def status_cmd(interaction: discord.Interaction):
         retry = "（自動で再接続を試しています）" if ENGINE_AUTO_RECONNECT else ""
         if eng is None:
             lines.append(f"・{ENGINE_LABELS[key]}: 未接続{retry}")
+        elif eng.hung:
+            lines.append(f"・{eng.display_name}: 固まっています（エンジンを再起動すると直ります）")
         elif eng.fail_streak >= FAIL_NOTICE_THRESHOLD:
             lines.append(f"・{eng.display_name}: 不調（連続{eng.fail_streak}回失敗）{retry if eng.can_reconnect else ''}")
         else:
@@ -2318,6 +2410,15 @@ def setup_logging():
         log.warning("ログファイルを作れませんでした（画面にだけ出力します）: %s", log_error)
 
 
+def exit_process(code: int = 0):
+    """終了する。固まったスレッドが残っていると普通の終了では終われないので、そのときは強制的に終わる"""
+    if TTSEngine.any_stuck:
+        logging.shutdown()
+        sys.stdout.flush()
+        os._exit(code)
+    sys.exit(code)
+
+
 def main():
     setup_logging()
     log.info("設定ファイル: %s（%s）", CONFIG_PATH.name, "読み込み" if CONFIG_PATH.exists() else "なし → 既定値")
@@ -2337,10 +2438,12 @@ def main():
         if os.environ.get("MULTITTSBOT_LOOP") == "1":
             # Start.bat のくり返し起動の中で動いている → 終了コード 3 で抜け、Start.bat にすぐ起動し直してもらう
             # （ここで新しいプロセスも起動すると、BOTが2つ動いてしまう）
-            sys.exit(3)
+            exit_process(3)
         # os.execv はWindowsで挙動が不安定なので、新プロセスを起動してから終了する
         flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         subprocess.Popen([sys.executable, *sys.argv], creationflags=flags)
+    if TTSEngine.any_stuck:
+        exit_process(0)
 
 
 if __name__ == "__main__":
