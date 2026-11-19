@@ -14,8 +14,11 @@ data_dir =
 # BOTを2つ動かすとき、両方で同じフォルダを指定すると、話者・速度・辞書が共有されます
 shared_dir =
 
-# 管理者（/restart /presence が使える人）のユーザーID。カンマ区切り
+# BOTオーナー（/settings の「🤖 BOT」タブで表示の変更・再起動ができる人）のユーザーID。カンマ区切り
 owner_ids =
+
+# /credit に出す、クレジット（表記のしかた・利用規約の一覧）のページのURL。空なら出しません
+credit_url =
 
 # 入っていてよいサーバーのID（カンマ区切り）。書くと、それ以外のサーバーからは自動で抜けます
 # 空なら制限なし（どのサーバーにもいられる）
@@ -71,7 +74,7 @@ fail_notice_cooldown_seconds = 600
 [voice]
 # 話者を設定していないユーザーに、自動で割り当てる声の候補エンジン（カンマ区切り）
 # 最初に発言したときにランダムで1つ決まり、その後はずっと同じ声になります
-# （本人が /voice で選べば、そちらが優先されます）
+# （本人が /settings で選べば、そちらが優先されます）
 # 選べる値: roid, aivoice, voicevox, cevio
 random_engines = aivoice, roid
 
@@ -85,7 +88,7 @@ overflow_notice_seconds = 60
 max_text_len = 300
 # 名前読み上げON時、同じ人の連続発言で名前を省略する秒数
 name_repeat_seconds = 60
-# /voices の1ページあたりの表示数
+# （使われなくなった項目です。残っていても問題ありません）
 voices_per_page = 10
 # 辞書の登録上限と、1語あたりの最大文字数
 dict_max_entries = 500
@@ -97,7 +100,7 @@ dict_max_reading = 60
 # この文字で始まる発言は読み上げない（カンマ区切り）
 skip_prefixes = ;, ；, //, /
 
-# 初めて使うサーバーでの初期値（on / off）。サーバーごとに /readname /announce で変更できます
+# 初めて使うサーバーでの初期値（on / off）。サーバーごとに /settings で変更できます
 # 発言者の名前を読み上げる
 default_read_name = off
 # VCの入退室を読み上げる
@@ -109,7 +112,7 @@ default_announce = off
 
 [presence]
 # BOTの「プレイ中」表示を、読み上げ中のサーバー数で自動更新する
-# /presence で文字を指定すると、自動表示はオフになります（/presence auto:True で戻せます）
+# /settings の「🤖 BOT」タブで文字を指定すると、自動表示はオフになります（同じ画面でONに戻せます）
 auto = on
 # 読み上げ中のサーバーがあるときの表示。{n} がサーバー数になります
 auto_active = {n}サーバーで読み上げ中

@@ -38,6 +38,13 @@ from typing import Optional
 import discord
 from discord import app_commands
 
+if not hasattr(discord.ui, "Label"):
+    # 設定画面のポップアップ（中にプルダウンを置く）は discord.py 2.6 以上の機能
+    raise SystemExit(
+        f"discord.py が古いです（いま {discord.__version__}）。2.6 以上が必要です。\n"
+        "次のコマンドで更新してください:  pip install -U discord.py"
+    )
+
 try:
     import requests
 except ImportError:
@@ -132,6 +139,7 @@ AUTO_RESUME = cfg_bool("bot", "auto_resume", True)
 # 通信の不具合などでVCから切断されたとき、同じVCに自動で入り直す（/leave や無人で抜けたときは戻らない）
 AUTO_REJOIN = cfg_bool("bot", "auto_rejoin", True)
 REJOIN_DELAYS = (5, 15, 30)   # 入り直しを試すまでの待ち秒数（この回数まで試して、だめなら止める）
+VOICE_RECOVER_WAIT_SECONDS = 45   # discord.py 自身の再接続（30秒で失敗する）の結果を待つ最大秒数
 
 # --- [engine] ---
 VOICEROID_INSTALL_PATH = cfg_str("engine", "voiceroid_install_path") or None
@@ -179,7 +187,7 @@ DICT_MAX_READING = cfg_int("limits", "dict_max_reading", 60)
 
 # --- [reading] ---
 SKIP_PREFIXES = tuple(cfg_list("reading", "skip_prefixes", ";, ；, //, /"))   # この文字で始まる発言は読まない
-# 未設定のサーバーでの初期値（サーバーごとに /readname /announce で変更できる）
+# 未設定のサーバーでの初期値（サーバーごとに /settings で変更できる）
 DEFAULT_READ_NAME = cfg_bool("reading", "default_read_name", False)
 DEFAULT_ANNOUNCE = cfg_bool("reading", "default_announce", False)
 
@@ -868,7 +876,7 @@ class SharedStore(JsonStore):
 
 
 class UserSettings(SharedStore):
-    # auto: 未設定だったので自動で割り当てた話者（/voice で選ぶと False になる）
+    # auto: 未設定だったので自動で割り当てた話者（/settings で選ぶと False になる）
     DEFAULTS = {"engine": None, "voice": None, "auto": False, "speed": 1.0, "pitch": 1.0}
 
     def get(self, user_id: int) -> dict:
@@ -946,6 +954,16 @@ class Dictionary(SharedStore):
     def add(self, guild_id: int, word: str, reading: str):
         def fn(d):
             d.setdefault(str(guild_id), {})[word] = reading
+        self.mutate(fn)
+        self._cache.pop(str(guild_id), None)
+
+    def replace(self, guild_id: int, old_word: str, word: str, reading: str):
+        """登録済みの語を書き換える（表記を変えた場合は古い語を消す）"""
+        def fn(d):
+            m = d.setdefault(str(guild_id), {})
+            if old_word != word:
+                m.pop(old_word, None)
+            m[word] = reading
         self.mutate(fn)
         self._cache.pop(str(guild_id), None)
 
@@ -1056,7 +1074,7 @@ def stored_presence() -> tuple[str, str, Optional[str]]:
 
 def presence_auto() -> bool:
     """ステータスを自動表示（読み上げ中のサーバー数）にするか。
-    /presence で一度も指定していない場合は config の初期値。ただし以前に自分で文字を設定していたなら、それを消さない"""
+    設定画面で一度も指定していない場合は config の初期値。ただし以前に自分で文字を設定していたなら、それを消さない"""
     d = presence_store.data
     if isinstance(d.get("auto"), bool):
         return d["auto"]
@@ -1569,86 +1587,981 @@ def build_speech_text(message: discord.Message) -> str:
     return text
 
 
-# ====================== 話者一覧UI ======================
-def find_unified_index(user_id: int) -> Optional[int]:
-    try:
-        eng, voice = resolve_user_voice(user_id)
-    except RuntimeError:
-        return None
-    return unified_index_by_key.get((eng.name, voice.key))
+# ====================== 設定パネル（/settings） ======================
+SELECT_MAX = 25          # Discordのプルダウンに出せる項目数の上限
+DICT_PER_PAGE = 15
+VOLUME_STEPS = [10, 25, 50, 75, 90, 100, 110, 125, 150, 175, 200]
 
 
-class VoicesPager(discord.ui.View):
-    def __init__(self, user_id: int):
-        super().__init__(timeout=180)
-        self.user_id = user_id
-        self.filter_engine: Optional[str] = None
-        self.page = 0
+def _steps(lo: float, hi: float, step: float = 0.1) -> list[float]:
+    n = int(round((hi - lo) / step))
+    return [round(lo + step * i, 2) for i in range(n + 1)][:SELECT_MAX]
 
-        options = [discord.SelectOption(label="すべて", value="__all__")]
-        options += [
-            discord.SelectOption(label=e.display_name, value=e.name) for e in engines.values()
-        ]
-        self.select = discord.ui.Select(placeholder="エンジンで絞り込み", options=options, row=0)
-        self.select.callback = self._on_select
-        self.add_item(self.select)
-        self._refresh()
 
-    def _items(self) -> list[tuple[int, UVoice]]:
-        return [
-            (i, u) for i, u in enumerate(unified)
-            if self.filter_engine is None or u.engine.name == self.filter_engine
-        ]
+_KATA_TO_HIRA = {c: c - 0x60 for c in range(ord("ァ"), ord("ヶ") + 1)}
 
-    def _refresh(self):
-        self.items = self._items()
-        self.total_pages = max(1, (len(self.items) + VOICES_PER_PAGE - 1) // VOICES_PER_PAGE)
-        self.page = max(0, min(self.page, self.total_pages - 1))
-        self.prev_btn.disabled = self.page <= 0
-        self.next_btn.disabled = self.page >= self.total_pages - 1
 
-    def build_content(self) -> str:
-        self._refresh()
-        filt = "すべて" if self.filter_engine is None else ENGINE_LABELS.get(
-            self.filter_engine, self.filter_engine
+def normalize_search(text: str) -> str:
+    """検索用に表記ゆれをそろえる（全角半角・大文字小文字・カタカナ→ひらがな・空白）"""
+    t = unicodedata.normalize("NFKC", text).casefold().translate(_KATA_TO_HIRA)
+    return re.sub(r"\s+", "", t)
+
+
+def voice_groups(eng: "TTSEngine") -> list[tuple[str, list[Voice]]]:
+    """エンジンの話者を、キャラクターごとにまとめる（並び順はそのまま）。
+    「ずんだもん（ノーマル）」「ずんだもん（あまあま）」→ ずんだもん: [ノーマル, あまあま]"""
+    groups: dict[str, list[Voice]] = {}
+    for v in eng.voices:
+        groups.setdefault(_character_name(v.label), []).append(v)
+    return list(groups.items())
+
+
+def style_name(character: str, voice: Voice) -> str:
+    """キャラクター名を除いた「話し方」の名前。話し方の名前がなければ「標準」"""
+    rest = voice.label[len(character):] if voice.label.startswith(character) else voice.label
+    rest = rest.strip()
+    if rest.startswith("（") and rest.endswith("）"):
+        rest = rest[1:-1]
+    return rest or "標準"
+
+
+def default_style(voices: list[Voice]) -> Voice:
+    """キャラクターだけ選んだときの話し方（「ノーマル」があればそれ、なければ最初）"""
+    return next((v for v in voices if v.label.endswith("（ノーマル）")), voices[0])
+
+
+def search_voices(query: str) -> list["UVoice"]:
+    """話者名（エンジン名を含む）の一部で探す。名前の頭から一致するものを先に並べる"""
+    q = normalize_search(query)
+    if not q:
+        return list(unified)
+    hits = []
+    for u in unified:
+        name = normalize_search(u.voice.label)
+        if q in name:
+            hits.append((0 if name.startswith(q) else 1, u))
+        elif q in normalize_search(u.label):
+            hits.append((2, u))
+    hits.sort(key=lambda h: h[0])   # 同じ順位の中では元の並び順のまま
+    return [u for _, u in hits]
+
+
+def check_dict_entry(guild_id: int, word: str, reading: str,
+                     old_word: Optional[str] = None) -> tuple[str, str, Optional[str]]:
+    """辞書に登録する内容を整えてチェックする。戻り値: (表記, 読み, エラー文。問題なければ None)
+    old_word: 編集のとき、元の表記"""
+    word, reading = re.sub(r"\s+", " ", word.strip()), reading.strip()
+    if not word or not reading:
+        return word, reading, "表記と読みを入力してください"
+    problem = validate_dict_word(word)
+    if problem:
+        return word, reading, problem
+    if len(word) > DICT_MAX_WORD or len(reading) > DICT_MAX_READING:
+        return word, reading, f"長すぎます（表記{DICT_MAX_WORD}文字・読み{DICT_MAX_READING}文字まで）"
+    m = dictionary.get_map(guild_id)
+    if old_word is not None and old_word in m:
+        if word != old_word and word in m:
+            return word, reading, f"`{word}` はすでに登録されています"
+    elif word not in m and len(m) >= DICT_MAX_ENTRIES:
+        return word, reading, f"登録数が上限（{DICT_MAX_ENTRIES}件）です"
+    return word, reading, None
+
+
+class DictEntryModal(discord.ui.Modal):
+    def __init__(self, panel: "SettingsPanel", old_word: Optional[str] = None, old_reading: str = ""):
+        super().__init__(title="辞書を編集" if old_word else "辞書に登録")
+        self.panel = panel
+        self.old_word = old_word
+        self.word = discord.ui.TextInput(
+            label="表記（この文字を…）", default=old_word, max_length=max(1, DICT_MAX_WORD),
         )
-        current = find_unified_index(self.user_id)
-        start = self.page * VOICES_PER_PAGE
-        end = min(start + VOICES_PER_PAGE, len(self.items))
-        lines = [
-            f"**話者一覧**｜フィルタ: `{filt}`｜{self.page + 1}/{self.total_pages}ページ",
-            f"該当 {len(self.items)} 件（全体 {len(unified)}）",
-            "`/voice` に名前（一部でOK）か番号を入れて選択",
-            "",
-        ]
-        for i, u in self.items[start:end]:
-            mark = " ← あなた" if i == current else ""
-            lines.append(f"`{i}` : {u.label}{mark}")
-        if not self.items:
-            lines.append("（該当なし）")
-        return "\n".join(lines)
+        self.reading = discord.ui.TextInput(
+            label="読み（…こう読む）", default=old_reading or None, max_length=max(1, DICT_MAX_READING),
+        )
+        self.add_item(self.word)
+        self.add_item(self.reading)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.panel.submit_dict(interaction, self.old_word, self.word.value, self.reading.value)
+
+
+class DictSearchModal(discord.ui.Modal, title="辞書を検索"):
+    query = discord.ui.TextInput(label="表記か読みの一部", required=False, max_length=60)
+
+    def __init__(self, panel: "SettingsPanel"):
+        super().__init__()
+        self.panel = panel
+        self.query.default = panel.dict_query or None
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.panel.dict_query = self.query.value.strip()
+        self.panel.dict_page = 0
+        self.panel.dict_selected = None
+        await self.panel.refresh(interaction)
+
+
+class VoiceSearchModal(discord.ui.Modal, title="話者を検索"):
+    query = discord.ui.TextInput(label="話者名の一部（例: ずんだ、きりたん、VOICEVOX）", max_length=40)
+
+    def __init__(self, panel: "SettingsPanel"):
+        super().__init__()
+        self.panel = panel
+        self.query.default = panel.voice_query or None
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.panel.voice_query = self.query.value.strip()
+        await self.panel.refresh(interaction)
+
+
+class SettingsPanel(discord.ui.View):
+    """自分の声・辞書・サーバー設定を、プルダウンとボタンで変更する画面（本人にだけ見える）"""
+    TABS = {"me": "🎤 自分の声", "dict": "📖 辞書", "server": "⚙ サーバー", "bot": "🤖 BOT"}
+
+    def __init__(self, interaction: discord.Interaction, tab: str = "me"):
+        super().__init__(timeout=14 * 60)   # 元の応答を編集できるのは15分まで
+        self.origin = interaction
+        self.user_id = interaction.user.id
+        self.guild = interaction.guild
+        self.tab = tab if self._tab_visible(tab) else "me"
+        self.engine_filter: Optional[str] = None
+        self.voice_page = 0
+        self.dict_page = 0
+        self.dict_query = ""
+        self.dict_selected: Optional[str] = None
+        self.notice = ""
+        self._voice_opts: dict[str, tuple[str, str]] = {}
+        self.voice_query = ""
+        self.confirm_restart = False
+        self.char_selected: Optional[str] = None   # 話者メニューで選んでいるキャラクター
+        self._char_opts: dict[str, tuple[str, str]] = {}
+
+    # ---------- 共通 ----------
+    def can_manage(self, user) -> bool:
+        if is_owner(user.id):
+            return True
+        perms = getattr(user, "guild_permissions", None)
+        return bool(perms and perms.manage_guild)
+
+    def _button(self, label: str, row: int, callback, style=discord.ButtonStyle.secondary, disabled=False):
+        b = discord.ui.Button(label=label, style=style, row=row, disabled=disabled)
+        b.callback = callback
+        self.add_item(b)
+
+    def _select(self, placeholder: str, options: list, row: int, callback):
+        s = discord.ui.Select(placeholder=placeholder[:150], options=options[:SELECT_MAX], row=row)
+        s.callback = lambda i, _s=s: callback(i, _s.values[0])
+        self.add_item(s)
+
+    def _tab_visible(self, tab: str) -> bool:
+        if tab in ("dict", "server"):
+            return self.guild is not None
+        if tab == "bot":
+            return is_owner(self.user_id)   # BOTのステータスは、BOTオーナーだけ
+        return tab == "me"
+
+    def render(self) -> str:
+        self.clear_items()
+        for key, label in self.TABS.items():
+            if not self._tab_visible(key):
+                continue
+            active = key == self.tab
+            self._button(label, 0, lambda i, k=key: self._switch(i, k),
+                         style=discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary,
+                         disabled=active)
+        body = {"me": self._render_me, "dict": self._render_dict, "server": self._render_server,
+                "bot": self._render_bot}[self.tab]()
+        if self.notice:
+            body += f"\n\n{self.notice}"
+            self.notice = ""
+        return body[:2000]
+
+    async def refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content=self.render(), view=self)
+
+    async def _switch(self, interaction: discord.Interaction, tab: str):
+        self.tab = tab
+        self.confirm_restart = False
+        await self.refresh(interaction)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("他の人の一覧です", ephemeral=True)
+            await interaction.response.send_message("他の人の設定画面です。`/settings` で開いてください", ephemeral=True)
             return False
         return True
 
-    async def _on_select(self, interaction: discord.Interaction):
-        value = self.select.values[0]
-        self.filter_engine = None if value == "__all__" else value
-        self.page = 0
-        await interaction.response.edit_message(content=self.build_content(), view=self)
+    async def on_timeout(self):
+        with contextlib.suppress(Exception):
+            await self.origin.edit_original_response(
+                content="設定画面を閉じました（時間切れ）。`/settings` で開き直せます", view=None
+            )
 
-    @discord.ui.button(label="◀ 前へ", style=discord.ButtonStyle.primary, row=1)
-    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page = max(0, self.page - 1)
-        await interaction.response.edit_message(content=self.build_content(), view=self)
+    # ---------- 自分の声 ----------
+    def _render_me(self) -> str:
+        if not engines:
+            return "**🎤 自分の声**\nいま使える音声エンジンがありません。エンジンが起動すると、自動で接続します"
+        eng, cur = resolve_user_voice(self.user_id)
+        s = settings.get(self.user_id)
+        if self.engine_filter not in engines or not engines[self.engine_filter].voices:
+            self.engine_filter = eng.name
+            self.voice_page = None   # 今の話者があるページを開く
+        view_eng = engines[self.engine_filter]
+        speed, pitch = float(s["speed"]), float(s["pitch"])
 
-    @discord.ui.button(label="次へ ▶", style=discord.ButtonStyle.primary, row=1)
-    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page = min(self.total_pages - 1, self.page + 1)
-        await interaction.response.edit_message(content=self.build_content(), view=self)
+        # 行0: タブ＋試し聞き
+        self._button("🎧 試し聞き", 0, self._on_test, style=discord.ButtonStyle.success)
+        # 行1: 名前で検索（いちばん目立つところ）・速度ピッチ
+        searching = bool(self.voice_query)
+        self._button("🔍 別の名前で検索" if searching else "🔍 話者を名前で検索", 1, self._on_voice_search,
+                     style=discord.ButtonStyle.primary)
+        if searching:
+            self._button("✖ 検索をやめる", 1, self._on_voice_clear)
+        self._button("✏ 速度・ピッチ", 1, self._on_tune)
+        self._button("📋 話者一覧", 1, self._on_list)
+
+        guide = ""
+        if searching:
+            # 行2: 検索結果（全エンジンから）
+            hits = search_voices(self.voice_query)
+            shown = hits[:SELECT_MAX]
+            self._voice_opts = {}
+            opts = []
+            for i, u in enumerate(shown):
+                value = f"v:{i}"
+                self._voice_opts[value] = (u.engine.name, u.voice.key)
+                is_cur = u.engine is eng and u.voice.key == cur.key
+                opts.append(discord.SelectOption(
+                    label=u.voice.label[:100], value=value, default=is_cur,
+                    description=f"{u.engine.display_name}" + ("・いまの声" if is_cur else ""),
+                ))
+            if hits:
+                self._select(f"🔍「{self.voice_query}」の結果から選ぶ（{len(hits)}件）", opts, 2, self._on_voice)
+                guide = f"🔍 「**{self.voice_query}**」の検索結果：**{len(hits)}件** ↓ 下のメニューから選んでください"
+                if len(hits) > len(shown):
+                    guide += f"\n-# 多いので{len(shown)}件だけ出しています。言葉を足して絞ってください"
+            else:
+                guide = (f"🔍 「**{self.voice_query}**」は見つかりませんでした\n"
+                         "-# ひらがな・カタカナは区別しません。短くするか、別の名前で試してください")
+        else:
+            # 行2: エンジン、行3: キャラクター、行4: 話し方
+            opts = [
+                discord.SelectOption(label=e.display_name, value=e.name, default=e.name == view_eng.name,
+                                     description=f"{len(voice_groups(e))}人・{len(e.voices)}話者")
+                for key in ENGINE_ORDER if (e := engines.get(key)) and e.voices
+            ]
+            self._select("エンジンを選ぶ", opts, 2, self._on_engine)
+            self._render_characters(eng, cur, view_eng)
+            guide = "-# 下のメニューで選ぶと、すぐに保存されます。名前がわかるなら「🔍 話者を名前で検索」が早いです"
+
+        auto = "\n-# 自動で割り当てた声です。好きな声を選ぶと、そちらに変わります" if s.get("auto") else ""
+        return (
+            "**🎤 自分の声**（全サーバー共通）\n"
+            f"🗣 いまの声：**{cur.label}**　`{eng.display_name}`\n"
+            f"速度 **{speed}**・ピッチ **{pitch}**{auto}\n\n"
+            + guide
+        )
+
+    def _render_characters(self, eng, cur, view_eng):
+        groups = voice_groups(view_eng)
+        names = [n for n, _ in groups]
+        cur_char = _character_name(cur.label) if view_eng is eng else None
+        if self.char_selected not in names:
+            self.char_selected = cur_char
+            self.voice_page = None   # 選んでいるキャラクターがあるページを開く
+
+        # 行3: キャラクター（多いときはページ送り。そのときは「前へ」「次へ」で2枠使う）
+        paged = len(groups) > SELECT_MAX
+        size = SELECT_MAX - 2 if paged else SELECT_MAX
+        pages = max(1, (len(groups) + size - 1) // size)
+        if self.voice_page is None:
+            self.voice_page = (names.index(self.char_selected) if self.char_selected in names else 0) // size
+        self.voice_page = max(0, min(self.voice_page, pages - 1))
+        start = self.voice_page * size
+        self._char_opts = {}
+        opts = []
+        if paged and self.voice_page > 0:
+            opts.append(discord.SelectOption(label="◀ 前のページへ", value="nav:prev",
+                                             description=f"{self.voice_page}/{pages}ページ目に戻る"))
+        for i, (name, vs) in enumerate(groups[start:start + size], start):
+            value = f"c:{i}"
+            self._char_opts[value] = (view_eng.name, name)
+            desc = [f"{len(vs)}種類の話し方"] if len(vs) > 1 else []
+            if name == cur_char:
+                desc.append("いまの声")
+            opts.append(discord.SelectOption(label=name[:100], value=value, default=name == self.char_selected,
+                                             description="・".join(desc) or None))
+        if paged and self.voice_page < pages - 1:
+            opts.append(discord.SelectOption(label="次のページへ ▶", value="nav:next",
+                                             description=f"{self.voice_page + 2}/{pages}ページ目へ"))
+        page_note = f"・{self.voice_page + 1}/{pages}ページ" if paged else ""
+        self._select(f"キャラクターを選ぶ（{view_eng.display_name}・{len(groups)}人{page_note}）",
+                     opts, 3, self._on_character)
+
+        # 行4: 話し方（選んだキャラクターに2つ以上あるときだけ）
+        styles = dict(groups).get(self.char_selected) or []
+        self._voice_opts = {}
+        if len(styles) > 1:
+            opts = []
+            for i, v in enumerate(styles[:SELECT_MAX]):
+                value = f"v:{i}"
+                self._voice_opts[value] = (view_eng.name, v.key)
+                is_cur = view_eng is eng and v.key == cur.key
+                opts.append(discord.SelectOption(label=style_name(self.char_selected, v)[:100], value=value,
+                                                 default=is_cur, description="いまの声" if is_cur else None))
+            self._select(f"話し方を選ぶ（{self.char_selected}・{len(styles)}種類）", opts, 4, self._on_voice)
+
+    async def _on_engine(self, interaction: discord.Interaction, value: str):
+        self.engine_filter = value
+        self.voice_page = 0
+        self.voice_query = ""
+        self.char_selected = None
+        self.notice = "下のメニューからキャラクターを選んでください"
+        await self.refresh(interaction)
+
+    async def _on_character(self, interaction: discord.Interaction, value: str):
+        if value in ("nav:prev", "nav:next"):
+            self.voice_page = (self.voice_page or 0) + (1 if value == "nav:next" else -1)
+            await self.refresh(interaction)
+            return
+        hit = self._char_opts.get(value)
+        eng = engines.get(hit[0]) if hit else None
+        styles = dict(voice_groups(eng)).get(hit[1]) if eng else None
+        if not styles:
+            self.notice = "⚠ そのキャラクターは今は使えません。選び直してください"
+        else:
+            name = hit[1]
+            self.char_selected = name
+            ceng, cv = resolve_user_voice(self.user_id)
+            if ceng is eng and _character_name(cv.label) == name:
+                self.notice = f"いまも **{name}** です" + ("。話し方は下のメニューで変えられます" if len(styles) > 1 else "")
+            else:
+                v = default_style(styles)
+                settings.update(self.user_id, engine=eng.name, voice=v.key, auto=False)
+                if len(styles) > 1:
+                    self.notice = (f"✅ **{name}**（{style_name(name, v)}）にしました。"
+                                   f"話し方（{len(styles)}種類）は、いちばん下のメニューで変えられます")
+                else:
+                    self.notice = f"✅ 話者を **[{eng.display_name}] {name}** にしました"
+        await self.refresh(interaction)
+
+    async def _on_list(self, interaction: discord.Interaction):
+        await open_catalog(interaction)
+
+    async def _on_voice_search(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(VoiceSearchModal(self))
+
+    async def _on_voice_clear(self, interaction: discord.Interaction):
+        self.voice_query = ""
+        self.voice_page = None   # 今の話者があるページに戻す
+        self.engine_filter = None
+        self.char_selected = None
+        await self.refresh(interaction)
+
+    async def _on_voice(self, interaction: discord.Interaction, value: str):
+        """話し方のメニュー・検索結果から、話者を1つ選んだとき"""
+        hit = self._voice_opts.get(value)
+        eng = engines.get(hit[0]) if hit else None
+        v = eng.find_voice(hit[1]) if eng else None
+        if v is None:
+            self.notice = "⚠ その話者は今は使えません。選び直してください"
+        else:
+            settings.update(self.user_id, engine=eng.name, voice=v.key, auto=False)
+            self.notice = f"✅ 話者を **[{eng.display_name}] {v.label}** にしました"
+        await self.refresh(interaction)
+
+    async def _on_tune(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(TuneModal(self))
+
+    async def _on_test(self, interaction: discord.Interaction):
+        await send_private_test(interaction)   # VCには流さず、本人にだけ音声ファイルで送る
+
+    # ---------- 辞書 ----------
+    def _dict_entries(self) -> list[tuple[str, str]]:
+        items = sorted(dictionary.get_map(self.guild.id).items())
+        q = self.dict_query.casefold()
+        if q:
+            items = [(w, r) for w, r in items if q in w.casefold() or q in r.casefold()]
+        return items
+
+    def _render_dict(self) -> str:
+        m = dictionary.get_map(self.guild.id)
+        items = self._dict_entries()
+        pages = max(1, (len(items) + DICT_PER_PAGE - 1) // DICT_PER_PAGE)
+        self.dict_page = max(0, min(self.dict_page, pages - 1))
+        shown = items[self.dict_page * DICT_PER_PAGE:(self.dict_page + 1) * DICT_PER_PAGE]
+        if self.dict_selected not in m:
+            self.dict_selected = None
+
+        if shown:
+            self._select("編集・削除する語を選ぶ", [
+                discord.SelectOption(label=w[:100], value=w, description=f"→ {r}"[:100],
+                                     default=w == self.dict_selected)
+                for w, r in shown
+            ], 1, self._on_dict_pick)
+        sel = self.dict_selected is None
+        self._button("➕ 追加", 2, self._on_dict_add, style=discord.ButtonStyle.success,
+                     disabled=len(m) >= DICT_MAX_ENTRIES)
+        self._button("✏ 編集", 2, self._on_dict_edit, disabled=sel)
+        self._button("🗑 削除", 2, self._on_dict_delete, style=discord.ButtonStyle.danger, disabled=sel)
+        self._button("◀", 2, lambda i: self._dict_move(i, -1), disabled=self.dict_page <= 0)
+        self._button("▶", 2, lambda i: self._dict_move(i, 1), disabled=self.dict_page >= pages - 1)
+        self._button("🔍 検索", 3, self._on_dict_search)
+        if self.dict_query:
+            self._button("✖ 検索をやめる", 3, self._on_dict_clear_search)
+
+        filt = f"｜検索: `{self.dict_query}`（{len(items)}件）" if self.dict_query else ""
+        lines = [
+            f"**📖 辞書**（このサーバー共通・{len(m)}/{DICT_MAX_ENTRIES}件）{filt}｜{self.dict_page + 1}/{pages}ページ",
+        ]
+        for w, r in shown:
+            mark = "▶ " if w == self.dict_selected else "・"
+            warn = "　⚠使われません（登録できない語です）" if validate_dict_word(w) else ""
+            lines.append(f"{mark}`{w}` → `{r}`{warn}")
+        if not shown:
+            lines.append("（該当なし）" if self.dict_query else "（まだ登録がありません。「➕ 追加」から登録できます）")
+        return "\n".join(lines)
+
+    async def _dict_move(self, interaction: discord.Interaction, delta: int):
+        self.dict_page += delta
+        self.dict_selected = None
+        await self.refresh(interaction)
+
+    async def _on_dict_pick(self, interaction: discord.Interaction, value: str):
+        self.dict_selected = value
+        await self.refresh(interaction)
+
+    async def _on_dict_add(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(DictEntryModal(self))
+
+    async def _on_dict_edit(self, interaction: discord.Interaction):
+        w = self.dict_selected
+        r = dictionary.get_map(self.guild.id).get(w) if w else None
+        if r is None:
+            self.notice = "⚠ その語は、もう登録されていません"
+            await self.refresh(interaction)
+            return
+        await interaction.response.send_modal(DictEntryModal(self, w, r))
+
+    async def _on_dict_delete(self, interaction: discord.Interaction):
+        w = self.dict_selected
+        if w and dictionary.remove(self.guild.id, w):
+            self.notice = f"🗑 削除しました: `{w}`"
+            log.info("[DICT] guild=%s user=%s 削除: %s", self.guild.id, self.user_id, w)
+        else:
+            self.notice = "⚠ その語は、もう登録されていません"
+        self.dict_selected = None
+        await self.refresh(interaction)
+
+    async def _on_dict_search(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(DictSearchModal(self))
+
+    async def _on_dict_clear_search(self, interaction: discord.Interaction):
+        self.dict_query = ""
+        self.dict_page = 0
+        await self.refresh(interaction)
+
+    async def submit_dict(self, interaction: discord.Interaction, old_word: Optional[str], word: str, reading: str):
+        word, reading, err = check_dict_entry(self.guild.id, word, reading, old_word)
+        if err:
+            self.notice = f"⚠ {err}"
+        else:
+            if old_word is not None and old_word in dictionary.get_map(self.guild.id):
+                dictionary.replace(self.guild.id, old_word, word, reading)
+                self.notice = f"✅ 変更しました: `{word}` → `{reading}`"
+            else:
+                dictionary.add(self.guild.id, word, reading)
+                self.notice = f"✅ 登録しました: `{word}` → `{reading}`"
+            log.info("[DICT] guild=%s user=%s 登録: %s → %s", self.guild.id, self.user_id, word, reading)
+            self.dict_selected = word
+            # 登録した語のあるページへ
+            keys = [w for w, _ in self._dict_entries()]
+            if word in keys:
+                self.dict_page = keys.index(word) // DICT_PER_PAGE
+        await self.refresh(interaction)
+
+    # ---------- サーバー ----------
+    def _render_server(self) -> str:
+        g = guild_settings.get(self.guild.id)
+        vol, rn, an = int(g["volume"]), bool(g["read_name"]), bool(g["announce"])
+        text = (
+            "**⚙ サーバー設定**（このサーバー共通）\n"
+            f"音量: **{vol}%**\n"
+            f"名前の読み上げ: **{'ON' if rn else 'OFF'}**　（「〇〇、本文」と読む）\n"
+            f"入退室の読み上げ: **{'ON' if an else 'OFF'}**"
+        )
+        if not self.can_manage(self.origin.user):
+            return text + "\n-# 変更には「サーバー管理」の権限が必要です"
+        self._button("✏ まとめて変える", 1, self._on_server_edit, style=discord.ButtonStyle.primary)
+        self._button("📌 このチャンネルに設定ボタンを置く", 1, self._on_place_launcher)
+        return text + "\n-# 「📌」を押すと、誰でも押せる「設定を開く」メッセージをこのチャンネルに置きます"
+
+    async def _guard_manage(self, interaction: discord.Interaction) -> bool:
+        if self.can_manage(interaction.user):
+            return True
+        self.notice = "⚠ 変更には「サーバー管理」の権限が必要です"
+        await self.refresh(interaction)
+        return False
+
+    async def _on_server_edit(self, interaction: discord.Interaction):
+        if await self._guard_manage(interaction):
+            await interaction.response.send_modal(ServerModal(self))
+
+    async def _on_place_launcher(self, interaction: discord.Interaction):
+        if not await self._guard_manage(interaction):
+            return
+        try:
+            await interaction.channel.send(embed=launcher_embed(), view=SettingsLauncher())
+            self.notice = "📌 このチャンネルに「設定を開く」メッセージを置きました（ピン留めがおすすめです）"
+            log.info("[SETTINGS] guild=%s user=%s 設定ボタンを設置: channel=%s",
+                     self.guild.id, self.user_id, interaction.channel_id)
+        except discord.Forbidden:
+            self.notice = "⚠ このチャンネルに書き込む権限がBOTにありません"
+        except Exception:
+            log.exception("設定ボタンの設置に失敗")
+            self.notice = "⚠ 置けませんでした"
+        await self.refresh(interaction)
+
+    # ---------- BOT（オーナーのみ） ----------
+    def _render_bot(self) -> str:
+        if self.confirm_restart:
+            self._button("🔄 はい、再起動する", 1, self._on_restart_yes, style=discord.ButtonStyle.danger)
+            self._button("やめる", 1, self._on_restart_no)
+            return (
+                "**🤖 BOT**\n"
+                "⚠ **本当に再起動しますか？**\n"
+                "接続中のVCからいったん抜けて、再起動のあと自動で戻ります。読み上げ待ちの分は読まれません。"
+            )
+        self._button("✏ 表示をまとめて変える", 1, self._on_bot_edit, style=discord.ButtonStyle.primary)
+        self._button("🔄 再起動", 1, self._on_restart, style=discord.ButtonStyle.danger)
+        return (
+            "**🤖 BOT**（BOTオーナーだけに出ます・全サーバー共通）\n"
+            + describe_presence() + "\n"
+            "-# 自動表示がONのときは「〇サーバーで読み上げ中」などを自動で出します"
+        )
+
+    async def _guard_owner(self, interaction: discord.Interaction) -> bool:
+        if is_owner(interaction.user.id):
+            return True
+        self.notice = "⚠ BOTオーナーだけが使えます"
+        await self.refresh(interaction)
+        return False
+
+    async def _on_bot_edit(self, interaction: discord.Interaction):
+        if await self._guard_owner(interaction):
+            await interaction.response.send_modal(PresenceModal(self))
+
+    async def _on_restart(self, interaction: discord.Interaction):
+        if await self._guard_owner(interaction):
+            self.confirm_restart = True
+            await self.refresh(interaction)
+
+    async def _on_restart_no(self, interaction: discord.Interaction):
+        self.confirm_restart = False
+        await self.refresh(interaction)
+
+    async def _on_restart_yes(self, interaction: discord.Interaction):
+        if not await self._guard_owner(interaction):
+            return
+        self.confirm_restart = False
+        self.stop()
+        await interaction.response.edit_message(content="🔄 再起動します…", view=None)
+        await request_restart(interaction.user.id)
+
+
+# ---------- ポップアップ（discord.py 2.6 以上：ポップアップの中にプルダウンを置く） ----------
+def _modal_select(choices: list[tuple[str, str]], current: str) -> discord.ui.Select:
+    """ポップアップ用のプルダウン。choices: (表示名, 値)。current を選んだ状態で開く"""
+    return discord.ui.Select(options=[
+        discord.SelectOption(label=label, value=value, default=value == current)
+        for label, value in choices[:SELECT_MAX]
+    ])
+
+
+def _picked(select: discord.ui.Select, fallback: str) -> str:
+    return select.values[0] if select.values else fallback
+
+
+def _num_choices(steps: list[float], name: str) -> list[tuple[str, str]]:
+    return [(f"{name} {v}" + ("（標準）" if v == 1.0 else ""), str(v)) for v in steps]
+
+
+def _num_current(steps: list[float], value: float) -> str:
+    """いまの値にいちばん近い選択肢（0.1刻みでない値が保存されていた場合のため）"""
+    return str(min(steps, key=lambda v: abs(v - value)))
+
+
+ON_OFF = [("ON（読む）", "on"), ("OFF（読まない）", "off")]
+
+
+class TuneModal(discord.ui.Modal, title="速度・ピッチ"):
+    def __init__(self, panel: SettingsPanel):
+        super().__init__()
+        self.panel = panel
+        s = settings.get(panel.user_id)
+        sp, pt = _steps(SPEED_MIN, SPEED_MAX), _steps(PITCH_MIN, PITCH_MAX)
+        self.cur_speed, self.cur_pitch = _num_current(sp, float(s["speed"])), _num_current(pt, float(s["pitch"]))
+        self.speed = _modal_select(_num_choices(sp, "速度"), self.cur_speed)
+        self.pitch = _modal_select(_num_choices(pt, "ピッチ"), self.cur_pitch)
+        self.add_item(discord.ui.Label(text="速度", description="1.0が標準。大きいほど速い", component=self.speed))
+        self.add_item(discord.ui.Label(text="ピッチ", description="1.0が標準。大きいほど高い", component=self.pitch))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        speed, pitch = float(_picked(self.speed, self.cur_speed)), float(_picked(self.pitch, self.cur_pitch))
+        settings.update(self.panel.user_id, speed=speed, pitch=pitch)
+        self.panel.notice = f"✅ 速度 **{speed}**・ピッチ **{pitch}** にしました"
+        await self.panel.refresh(interaction)
+
+
+class ServerModal(discord.ui.Modal, title="サーバー設定"):
+    def __init__(self, panel: SettingsPanel):
+        super().__init__()
+        self.panel = panel
+        g = guild_settings.get(panel.guild.id)
+        vol = int(g["volume"])
+        self.cur = (str(vol), "on" if g["read_name"] else "off", "on" if g["announce"] else "off")
+        steps = sorted(set(VOLUME_STEPS) | {vol})
+        self.volume = _modal_select([(f"音量 {v}%" + ("（標準）" if v == 100 else ""), str(v)) for v in steps],
+                                    self.cur[0])
+        self.read_name = _modal_select(ON_OFF, self.cur[1])
+        self.announce = _modal_select(ON_OFF, self.cur[2])
+        self.add_item(discord.ui.Label(text="音量", description="このサーバー共通。100%が標準", component=self.volume))
+        self.add_item(discord.ui.Label(text="名前の読み上げ", description="ONにすると「〇〇、本文」と読みます",
+                                       component=self.read_name))
+        self.add_item(discord.ui.Label(text="入退室の読み上げ", description="VCに入った・出た人を読み上げます",
+                                       component=self.announce))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not self.panel.can_manage(interaction.user):
+            self.panel.notice = "⚠ 変更には「サーバー管理」の権限が必要です"
+        else:
+            vol = int(_picked(self.volume, self.cur[0]))
+            rn = _picked(self.read_name, self.cur[1]) == "on"
+            an = _picked(self.announce, self.cur[2]) == "on"
+            guild_settings.update(self.panel.guild.id, volume=vol, read_name=rn, announce=an)
+            self.panel.notice = "✅ サーバー設定を保存しました"
+            log.info("[SETTINGS] guild=%s user=%s 音量=%s 名前=%s 入退室=%s",
+                     self.panel.guild.id, interaction.user.id, vol, rn, an)
+        await self.panel.refresh(interaction)
+
+
+class PresenceModal(discord.ui.Modal, title="BOTの表示"):
+    def __init__(self, panel: SettingsPanel):
+        super().__init__()
+        self.panel = panel
+        status, kind, text = stored_presence()
+        self.cur = (status, kind, "on" if presence_auto() else "off")
+        self.status = _modal_select([(label, key) for key, label in STATUS_LABELS.items()], status)
+        self.kind = _modal_select([(f"{label}（{key}）", key) for key, label in ACTIVITY_LABELS.items()], kind)
+        self.text = discord.ui.TextInput(default=text, required=False, max_length=ACTIVITY_MAX_LEN,
+                                         placeholder="例: /join で読み上げ")
+        self.auto = _modal_select([("ON", "on"), ("OFF", "off")], self.cur[2])
+        self.add_item(discord.ui.Label(text="ステータス", component=self.status))
+        self.add_item(discord.ui.Label(text="表示の種類", component=self.kind))
+        self.add_item(discord.ui.Label(text="表示する文字", description="自動表示がOFFのときに出します。空なら何も出しません",
+                                       component=self.text))
+        self.add_item(discord.ui.Label(text="自動表示", description="ONなら「〇サーバーで読み上げ中」などを自動で出します",
+                                       component=self.auto))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_owner(interaction.user.id):
+            self.panel.notice = "⚠ BOTオーナーだけが使えます"
+        else:
+            err = await change_presence(
+                status=_picked(self.status, self.cur[0]),
+                kind=_picked(self.kind, self.cur[1]),
+                activity=self.text.value,
+                auto=_picked(self.auto, self.cur[2]) == "on",
+            )
+            self.panel.notice = f"⚠ {err}" if err else "✅ BOTの表示を変えました"
+        await self.panel.refresh(interaction)
+
+
+TEST_TEXT = "テストです。この声で読み上げます"
+TEST_COOLDOWN_SECONDS = 5
+_test_last: dict[int, float] = {}
+
+
+async def send_private_test(interaction: discord.Interaction, sample: Optional[tuple] = None):
+    """合成した音声を、本人にだけ見えるメッセージで送る（VCには流さない）。
+    sample=(エンジン, 話者) を渡すと、自分の声を変えずにその声で試し聞きする（話者カタログから）"""
+    uid = interaction.user.id
+    now = time.monotonic()
+    if now - _test_last.get(uid, 0) < TEST_COOLDOWN_SECONDS:
+        await interaction.response.send_message("少し待ってから、もう一度押してください", ephemeral=True)
+        return
+    if not engines:
+        await interaction.response.send_message("いま使える音声エンジンがありません", ephemeral=True)
+        return
+    _test_last[uid] = now
+    await interaction.response.defer(ephemeral=True, thinking=True)   # 合成に3秒以上かかっても失敗しないように
+    path = None
+    try:
+        eng, voice = sample if sample else resolve_user_voice(uid)
+        s = settings.get(uid)
+        path = await eng.synth(TEST_TEXT, voice.key, float(s["speed"]), float(s["pitch"]))
+        if not path:
+            await interaction.followup.send("⚠ 合成できませんでした", ephemeral=True)
+            return
+        cur_eng, cur_voice = resolve_user_voice(uid)
+        changed = "" if (cur_eng is eng and cur_voice.key == voice.key) else "まだ声は変わっていません。"
+        await interaction.followup.send(
+            f"🎧 **[{eng.display_name}] {voice.label}**（速度 {s['speed']}・ピッチ {s['pitch']}）\n"
+            f"-# あなたにだけ見えています。{changed}▶ を押すと再生します",
+            file=discord.File(path, filename="test_voice.wav"),
+            ephemeral=True,
+        )
+    except Exception as e:
+        log.exception("試し聞きの合成に失敗")
+        with contextlib.suppress(Exception):
+            await interaction.followup.send(f"⚠ 合成に失敗しました（{type(e).__name__}）", ephemeral=True)
+    finally:
+        if path:
+            _remove_quietly(path)
+
+
+CATALOG_PER_PAGE = 15   # 1ページに並べるキャラクター（3列×5行）
+
+
+class VoiceCatalog(discord.ui.View):
+    """📋 話者一覧（話者カタログ）。エンジンごとにキャラクターを並べ、選ぶと詳しい画面になる。
+    自分の声を変えずに試し聞きでき、気に入ったら「この声にする」で決める（本人にだけ見える）"""
+
+    def __init__(self, interaction: discord.Interaction):
+        super().__init__(timeout=14 * 60)
+        self.origin = interaction
+        self.user_id = interaction.user.id
+        self.engine_name: Optional[str] = None
+        self.page: Optional[int] = None
+        self.char: Optional[str] = None        # 詳しい画面で見ているキャラクター（None なら一覧）
+        self.voice_key: Optional[str] = None   # 詳しい画面で選んでいる話し方
+        self.notice = ""
+        self._chars: dict[str, str] = {}
+
+    # ---------- 共通 ----------
+    def _button(self, label, row, callback, style=discord.ButtonStyle.secondary, disabled=False):
+        b = discord.ui.Button(label=label, style=style, row=row, disabled=disabled)
+        b.callback = callback
+        self.add_item(b)
+
+    def _current(self) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """いまの自分の声 (エンジン名, キャラクター名, 話者キー)"""
+        with contextlib.suppress(Exception):
+            eng, v = resolve_user_voice(self.user_id)
+            return eng.name, _character_name(v.label), v.key
+        return None, None, None
+
+    def render(self) -> tuple[str, discord.Embed]:
+        self.clear_items()
+        avail = [e for key in ENGINE_ORDER if (e := engines.get(key)) and e.voices]
+        if not avail:
+            return "", discord.Embed(title="📋 話者一覧", description="いま使える音声エンジンがありません")
+        cur_eng, cur_char, cur_key = self._current()
+        if self.engine_name not in [e.name for e in avail]:
+            self.engine_name = cur_eng if cur_eng in [e.name for e in avail] else avail[0].name
+            self.page, self.char = None, None
+        eng = engines[self.engine_name]
+        groups = voice_groups(eng)
+        if self.char is not None and self.char not in dict(groups):
+            self.char = None
+        embed = self._render_detail(eng, groups, cur_eng, cur_key) if self.char else \
+            self._render_list(eng, groups, avail, cur_eng, cur_char)
+        notice, self.notice = self.notice, ""
+        return notice, embed
+
+    async def refresh(self, interaction: discord.Interaction):
+        content, embed = self.render()
+        await interaction.response.edit_message(content=content or None, embed=embed, view=self)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("他の人の一覧です。`/settings` の「📋 話者一覧」で開いてください",
+                                                    ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        with contextlib.suppress(Exception):
+            await self.origin.edit_original_response(
+                content="話者一覧を閉じました（時間切れ）。`/settings` の「📋 話者一覧」で開き直せます", view=None)
+
+    # ---------- 一覧 ----------
+    def _render_list(self, eng, groups, avail, cur_eng, cur_char) -> discord.Embed:
+        pages = max(1, (len(groups) + CATALOG_PER_PAGE - 1) // CATALOG_PER_PAGE)
+        if self.page is None:
+            names = [n for n, _ in groups]
+            idx = names.index(cur_char) if (eng.name == cur_eng and cur_char in names) else 0
+            self.page = idx // CATALOG_PER_PAGE
+        self.page = max(0, min(self.page, pages - 1))
+        shown = groups[self.page * CATALOG_PER_PAGE:(self.page + 1) * CATALOG_PER_PAGE]
+
+        cells = []
+        for name, vs in shown:
+            text = name + (f" ({len(vs)})" if len(vs) > 1 else "")
+            cells.append(f"**★ {text}**" if (eng.name == cur_eng and name == cur_char) else text)
+        head = f"{len(groups)}人・{len(eng.voices)}話者" + (f"｜{self.page + 1}/{pages}ページ" if pages > 1 else "")
+        e = discord.Embed(title=f"📋 話者一覧 ─ {eng.display_name}", color=0x5865F2,
+                          description=head + "\n\n" + "\n".join(f"- {c}" for c in cells))   # 箇条書き
+        foot = "（ ）の数字は話し方の数です。下のメニューで選ぶと、試し聞きできます"
+        if eng.name == cur_eng:
+            foot = "★ は、いまのあなたの声です。" + foot
+        e.set_footer(text=foot)
+
+        # 行0: エンジン
+        for x in avail[:5]:
+            self._button(x.display_name, 0, lambda i, n=x.name: self._on_engine(i, n),
+                         style=discord.ButtonStyle.primary if x is eng else discord.ButtonStyle.secondary,
+                         disabled=x is eng)
+        # 行1: キャラクター
+        self._chars = {}
+        opts = []
+        for i, (name, vs) in enumerate(shown):
+            value = f"c:{i}"
+            self._chars[value] = name
+            desc = [f"{len(vs)}種類の話し方"] if len(vs) > 1 else []
+            if eng.name == cur_eng and name == cur_char:
+                desc.append("いまの声")
+            opts.append(discord.SelectOption(label=name[:100], value=value, description="・".join(desc) or None))
+        s = discord.ui.Select(placeholder="気になるキャラを選ぶ（試し聞きできます）", options=opts, row=1)
+        s.callback = lambda i, _s=s: self._on_char(i, _s.values[0])
+        self.add_item(s)
+        # 行2: ページ送り
+        if pages > 1:
+            self._button("◀ 前", 2, lambda i: self._on_page(i, -1), disabled=self.page <= 0)
+            self._button("次 ▶", 2, lambda i: self._on_page(i, 1), disabled=self.page >= pages - 1)
+        return e
+
+    async def _on_engine(self, interaction, name):
+        self.engine_name, self.page, self.char = name, 0, None
+        await self.refresh(interaction)
+
+    async def _on_page(self, interaction, delta):
+        self.page = (self.page or 0) + delta
+        await self.refresh(interaction)
+
+    async def _on_char(self, interaction, value):
+        self.char = self._chars.get(value)
+        self.voice_key = None
+        await self.refresh(interaction)
+
+    # ---------- キャラクターの詳しい画面 ----------
+    def _render_detail(self, eng, groups, cur_eng, cur_key) -> discord.Embed:
+        styles = dict(groups)[self.char]
+        keys = [v.key for v in styles]
+        if self.voice_key not in keys:
+            # いまの声のキャラなら、いまの話し方。そうでなければ「ノーマル」
+            self.voice_key = cur_key if (eng.name == cur_eng and cur_key in keys) else default_style(styles).key
+        voice = next(v for v in styles if v.key == self.voice_key)
+        is_cur = eng.name == cur_eng and voice.key == cur_key
+
+        desc = eng.display_name + (f"・話し方 {len(styles)}種類" if len(styles) > 1 else "")
+        if is_cur:
+            desc += "\n✅ いまのあなたの声です"
+        e = discord.Embed(title=f"🗣 {self.char}", color=0x5865F2, description=desc)
+        if len(styles) > 1:
+            e.add_field(name="話し方", inline=False, value="・".join(
+                f"**[{style_name(self.char, v)}]**" if v.key == voice.key else style_name(self.char, v) for v in styles))
+        if eng.name == "voicevox":
+            e.set_footer(text=f"クレジット表記：VOICEVOX:{VOICEVOX_CREDIT_NAMES.get(self.char, self.char)}")
+
+        # 行0: 話し方
+        if len(styles) > 1:
+            opts = [discord.SelectOption(label=style_name(self.char, v)[:100], value=v.key, default=v.key == voice.key,
+                                         description="いまの声" if (eng.name == cur_eng and v.key == cur_key) else None)
+                    for v in styles[:SELECT_MAX]]
+            s = discord.ui.Select(placeholder="話し方を選ぶ", options=opts, row=0)
+            s.callback = lambda i, _s=s: self._on_style(i, _s.values[0])
+            self.add_item(s)
+        # 行1: 試し聞き・決定・戻る
+        self._button("🎧 この声で試し聞き", 1, self._on_sample, style=discord.ButtonStyle.primary)
+        self._button("✅ いまの声です" if is_cur else "✅ この声にする", 1, self._on_choose,
+                     style=discord.ButtonStyle.success, disabled=is_cur)
+        self._button("◀ 一覧に戻る", 1, self._on_back)
+        return e
+
+    def _selected(self):
+        eng = engines.get(self.engine_name)
+        v = eng.find_voice(self.voice_key) if eng else None
+        return (eng, v) if v else None
+
+    async def _on_style(self, interaction, key):
+        self.voice_key = key
+        await self.refresh(interaction)
+
+    async def _on_sample(self, interaction):
+        sel = self._selected()
+        if sel is None:
+            self.notice = "⚠ その声は今は使えません"
+            await self.refresh(interaction)
+            return
+        await send_private_test(interaction, sample=sel)
+
+    async def _on_choose(self, interaction):
+        sel = self._selected()
+        if sel is None:
+            self.notice = "⚠ その声は今は使えません"
+        else:
+            eng, v = sel
+            settings.update(self.user_id, engine=eng.name, voice=v.key, auto=False)
+            self.notice = f"✅ あなたの声を **[{eng.display_name}] {v.label}** にしました"
+        await self.refresh(interaction)
+
+    async def _on_back(self, interaction):
+        self.char = None
+        await self.refresh(interaction)
+
+
+async def open_catalog(interaction: discord.Interaction):
+    view = VoiceCatalog(interaction)
+    content, embed = view.render()
+    await interaction.response.send_message(content=content or None, embed=embed, view=view, ephemeral=True)
+
+
+class SettingsLauncher(discord.ui.View):
+    """チャンネルに置いておく「設定を開く」メッセージ。BOTを再起動しても押せる（custom_id 固定・期限なし）"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎤 声を変える", style=discord.ButtonStyle.primary, custom_id="ttsset:me")
+    async def open_me(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_settings(interaction, "me")
+
+    @discord.ui.button(label="🎧 試し聞き", style=discord.ButtonStyle.success, custom_id="ttsset:test")
+    async def open_test(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_private_test(interaction)
+
+    @discord.ui.button(label="📖 辞書", style=discord.ButtonStyle.secondary, custom_id="ttsset:dict")
+    async def open_dict(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_settings(interaction, "dict")
+
+    @discord.ui.button(label="⚙ サーバー設定", style=discord.ButtonStyle.secondary, custom_id="ttsset:server")
+    async def open_server(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_settings(interaction, "server")
+
+    @discord.ui.button(label="📋 話者一覧", style=discord.ButtonStyle.secondary, custom_id="ttsset:list")
+    async def open_list(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_catalog(interaction)
+
+
+def launcher_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="🔊 読み上げBOTの設定",
+        description=(
+            "ボタンを押すと、**あなた専用の設定画面**が開きます（ほかの人には見えません）。\n\n"
+            "🎤 **声を変える** … 話者・速度・ピッチ（名前で検索もできます）\n"
+            "🎧 **試し聞き** … いまの自分の声を、自分だけで聞けます\n"
+            "📖 **辞書** … 読み方の登録・編集（サーバー共通）\n"
+            "⚙ **サーバー設定** … 音量・名前や入退室の読み上げ（変更は管理者のみ）\n"
+            "📋 **話者一覧** … 使えるキャラクターを、エンジンごとに一覧で見られます"
+        ),
+        color=0x5865F2,
+    )
+    e.set_footer(text="読み上げを始めるには、VCに入って /join")
+    return e
+
+
+async def open_settings(interaction: discord.Interaction, tab: str = "me"):
+    view = SettingsPanel(interaction, tab)
+    await interaction.response.send_message(content=view.render(), view=view, ephemeral=True)
 
 
 # ====================== Bot ======================
@@ -1672,6 +2585,7 @@ class TTSBot(discord.Client):
         self._tasks: list[asyncio.Task] = []
         self.retry_state: dict[str, dict] = {}      # エンジンごとの再接続の待ち時間
         self._rejoining: set[int] = set()           # 入り直しの最中のサーバー
+        self._voice_lost: set[int] = set()          # 再接続の結果を待っているサーバー
 
     async def setup_hook(self):
         for f in TEMP_DIR.iterdir():   # 前回の消し残し（音声と、A.I.VOICE が一緒に作る .txt）を掃除
@@ -1698,6 +2612,7 @@ class TTSBot(discord.Client):
             log.warning("使用できるエンジンがありません。エンジンが起動するのを待って、自動で再接続します")
         rebuild_unified_voices()
         migrate_legacy_settings()
+        self.add_view(SettingsLauncher())   # 置いてある「設定を開く」メッセージのボタンを、再起動後も使えるように
         log.info("エンジン: %s", list(engines.keys()))
 
         try:
@@ -1803,6 +2718,33 @@ class TTSBot(discord.Client):
             await asyncio.sleep(1)
 
     # ---- 切断されたときの入り直し ----
+    async def voice_lost(self, guild: discord.Guild, player: "GuildPlayer", vc: discord.VoiceClient):
+        """
+        discord.py は通信が切れると自分で入り直し、その途中でも「VCにいない」と通知が来る。
+        ここで片付けると進行中の再接続が壊れ、次の接続も応答が来ずに失敗するので、結果が出てから判断する。
+        discord.py があきらめたときや、外から切断されたときは guild.voice_client が消える。
+        """
+        if guild.id in self._voice_lost:
+            return
+        self._voice_lost.add(guild.id)
+        try:
+            for _ in range(VOICE_RECOVER_WAIT_SECONDS):
+                await asyncio.sleep(1)
+                if self._closing or player.voice_client is not vc:
+                    return   # /leave など、別の操作で片付いた
+                if vc.is_connected():
+                    log.info("VCに再接続しました: guild=%s", guild.id)
+                    return
+                if guild.voice_client is not vc:
+                    break
+            vc_id, text_id = player.voice_channel_id, player.text_channel_id
+            await player.shutdown()   # 状態を片付ける
+            if AUTO_REJOIN and vc_id is not None and text_id is not None:
+                log.warning("VCから切断されました: guild=%s → 入り直します", guild.id)
+                spawn(self.rejoin(guild, vc_id, text_id))
+        finally:
+            self._voice_lost.discard(guild.id)
+
     async def rejoin(self, guild: discord.Guild, vc_id: int, text_id: int):
         if guild.id in self._rejoining:
             return
@@ -1978,11 +2920,7 @@ async def on_voice_state_update(member: discord.Member, before, after):
         if after.channel is None:
             # /leave や無人での退出は、先に voice_client を外すので、ここには来ない。
             # ここに来るのは、通信の不具合や、手動で切断されたとき
-            vc_id, text_id = player.voice_channel_id, player.text_channel_id
-            await player.shutdown()   # 状態を片付ける
-            if AUTO_REJOIN and vc_id is not None and text_id is not None:
-                log.warning("VCから切断されました: guild=%s → 入り直します", member.guild.id)
-                spawn(bot.rejoin(member.guild, vc_id, text_id))
+            spawn(bot.voice_lost(member.guild, player, player.voice_client))
         elif player.voice_channel_id != after.channel.id:
             player.voice_channel_id = after.channel.id   # 別のVCへ移動させられた場合は、記録も更新
             player._save_session()
@@ -2021,6 +2959,9 @@ async def join(interaction: discord.Interaction):
             await interaction.response.send_message("読み上げるチャンネルをここに変更しました")
         else:
             await interaction.response.send_message("別のVCで使用中です", ephemeral=True)
+        return
+    if player.voice_client is not None:   # ここで接続し直すと、進行中の再接続が壊れる
+        await interaction.response.send_message("VCに再接続しています。少し待ってください", ephemeral=True)
         return
 
     await interaction.response.defer()   # 接続に3秒以上かかっても失敗しないように
@@ -2065,192 +3006,16 @@ async def clear_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("クリアしました")
 
 
-@bot.tree.command(name="voices", description="話者一覧（エンジンで絞り込み・ページ送り）")
-async def voices(interaction: discord.Interaction):
-    if not unified:
-        await interaction.response.send_message("話者がありません", ephemeral=True)
-        return
-    view = VoicesPager(user_id=interaction.user.id)
-    await interaction.response.send_message(content=view.build_content(), view=view, ephemeral=True)
-
-
-async def voice_autocomplete(interaction: discord.Interaction, current: str):
-    cur = current.strip().lower()
-    out = []
-    for i, u in enumerate(unified):
-        if cur in u.label.lower():
-            out.append(app_commands.Choice(name=u.label[:100], value=str(i)))
-            if len(out) >= 25:
-                break
-    return out
-
-
-def find_voice_by_input(query: str) -> tuple[Optional[UVoice], list[UVoice]]:
-    """番号 or 名前の一部から話者を探す。戻り値: (確定した話者, 複数ヒット時の候補)"""
-    q = query.strip()
-    if q.isdigit():
-        i = int(q)
-        return (unified[i], []) if 0 <= i < len(unified) else (None, [])
-    ql = q.lower()
-    exact = [u for u in unified if u.label.lower() == ql or u.voice.label.lower() == ql]
-    if len(exact) == 1:
-        return exact[0], []
-    hits = [u for u in unified if ql in u.label.lower()]
-    if len(hits) == 1:
-        return hits[0], []
-    return None, hits
-
-
-@bot.tree.command(name="voice", description="話者を変更（名前で検索）。省略すると現在の設定を表示")
-@app_commands.describe(voice="話者名（入力すると候補が出ます）")
-@app_commands.autocomplete(voice=voice_autocomplete)
-async def voice_cmd(interaction: discord.Interaction, voice: Optional[str] = None):
-    uid = interaction.user.id
-    if not engines:
-        await interaction.response.send_message(
-            "いま使える音声エンジンがありません。エンジンが起動すると、自動で接続します", ephemeral=True
-        )
-        return
-    if voice is None:
-        eng, v = resolve_user_voice(uid)
-        s = settings.get(uid)
-        auto = "（自動で割り当てた声です。`/voice` で変更できます）" if s.get("auto") else ""
-        await interaction.response.send_message(
-            f"**現在の設定**\n話者: `[{eng.display_name}] {v.label}`{auto}\n"
-            f"速度: `{s['speed']}`　ピッチ: `{s['pitch']}`",
-            ephemeral=True,
-        )
-        return
-
-    found, hits = find_voice_by_input(voice)
-    if found is None:
-        if hits:
-            names = "\n".join(f"・{u.label}" for u in hits[:8])
-            more = f"\n…ほか{len(hits) - 8}件" if len(hits) > 8 else ""
-            msg = f"候補が複数あります。もう少し絞ってください。\n{names}{more}"
-        else:
-            msg = "見つかりません。`/voices` で一覧を確認してください"
-        await interaction.response.send_message(msg, ephemeral=True)
-        return
-
-    settings.update(uid, engine=found.engine.name, voice=found.voice.key, auto=False)
-    await interaction.response.send_message(f"話者を変更 → **{found.label}**")
-
-
-@bot.tree.command(name="tune", description="読み上げの速度・ピッチを変更（1.0が標準）。省略すると現在値を表示")
-@app_commands.describe(speed="速度（0.5〜2.0）", pitch="ピッチ（0.5〜2.0）")
-async def tune(
-    interaction: discord.Interaction,
-    speed: Optional[app_commands.Range[float, SPEED_MIN, SPEED_MAX]] = None,
-    pitch: Optional[app_commands.Range[float, PITCH_MIN, PITCH_MAX]] = None,
-):
-    uid = interaction.user.id
-    if speed is None and pitch is None:
-        s = settings.get(uid)
-        await interaction.response.send_message(
-            f"速度 `{s['speed']}`　ピッチ `{s['pitch']}`", ephemeral=True
-        )
-        return
-    changes = {}
-    if speed is not None:
-        changes["speed"] = float(speed)
-    if pitch is not None:
-        changes["pitch"] = float(pitch)
-    settings.update(uid, **changes)
-    s = settings.get(uid)
-    await interaction.response.send_message(f"速度 **{s['speed']}**　ピッチ **{s['pitch']}**")
-
-
-@bot.tree.command(name="test", description="いまの自分の声で、テスト読み上げをする")
-@app_commands.guild_only()
-async def test_cmd(interaction: discord.Interaction):
-    player = players.get(interaction.guild.id)
-    if player is None or not player.active:
-        await interaction.response.send_message("先に /join で接続してください", ephemeral=True)
-        return
-    if not engines:
-        await interaction.response.send_message("いま使える音声エンジンがありません", ephemeral=True)
-        return
-    player.enqueue(make_utterance("テストです。この声で読み上げます", interaction.user.id))
-    await interaction.response.send_message("テスト読み上げを送りました", ephemeral=True)
-
-
-@bot.tree.command(name="volume", description="読み上げ音量（このサーバー共通・管理者向け）")
-@app_commands.describe(percent="10〜200（100が標準）")
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-async def volume_cmd(interaction: discord.Interaction, percent: app_commands.Range[int, 10, 200]):
-    guild_settings.update(interaction.guild.id, volume=int(percent))
-    await interaction.response.send_message(f"音量 **{percent}%**")
-
-
-@bot.tree.command(name="readname", description="発言者の名前も読み上げる（このサーバー共通・管理者向け）")
-@app_commands.describe(on="ONにすると「〇〇、本文」と読みます")
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-async def readname_cmd(interaction: discord.Interaction, on: bool):
-    guild_settings.update(interaction.guild.id, read_name=bool(on))
-    await interaction.response.send_message(f"名前の読み上げ: **{'ON' if on else 'OFF'}**")
-
-
-@bot.tree.command(name="announce", description="VCの入退室を読み上げる（このサーバー共通・管理者向け）")
-@app_commands.describe(on="ONにすると入退室を読み上げます")
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-async def announce_cmd(interaction: discord.Interaction, on: bool):
-    guild_settings.update(interaction.guild.id, announce=bool(on))
-    await interaction.response.send_message(f"入退室の読み上げ: **{'ON' if on else 'OFF'}**")
-
-
-@bot.tree.command(name="dict_add", description="辞書登録（サーバー共通）")
-@app_commands.describe(word="表記", reading="読み")
-@app_commands.guild_only()
-async def dict_add(interaction: discord.Interaction, word: str, reading: str):
-    word, reading = re.sub(r"\s+", " ", word.strip()), reading.strip()
-    if not word or not reading:
-        await interaction.response.send_message("表記と読みを入力してください", ephemeral=True)
-        return
-    problem = validate_dict_word(word)
-    if problem:
-        await interaction.response.send_message(problem, ephemeral=True)
-        return
-    if len(word) > DICT_MAX_WORD or len(reading) > DICT_MAX_READING:
-        await interaction.response.send_message(
-            f"長すぎます（表記{DICT_MAX_WORD}文字・読み{DICT_MAX_READING}文字まで）", ephemeral=True
-        )
-        return
-    m = dictionary.get_map(interaction.guild.id)
-    if word not in m and len(m) >= DICT_MAX_ENTRIES:
-        await interaction.response.send_message(f"登録数が上限（{DICT_MAX_ENTRIES}件）です", ephemeral=True)
-        return
-    dictionary.add(interaction.guild.id, word, reading)
-    await interaction.response.send_message(f"登録: `{word}` → `{reading}`")
-
-
-@bot.tree.command(name="dict_remove", description="辞書削除")
-@app_commands.describe(word="表記")
-@app_commands.guild_only()
-async def dict_remove(interaction: discord.Interaction, word: str):
-    if dictionary.remove(interaction.guild.id, word.strip()):
-        await interaction.response.send_message(f"削除: `{word}`")
-    else:
-        await interaction.response.send_message("見つかりません", ephemeral=True)
-
-
-@bot.tree.command(name="dict_list", description="辞書一覧")
-@app_commands.guild_only()
-async def dict_list(interaction: discord.Interaction):
-    m = dictionary.get_map(interaction.guild.id)
-    if not m:
-        await interaction.response.send_message("辞書は空です", ephemeral=True)
-        return
-    text = "**辞書**\n" + "\n".join(
-        f"`{w}` → `{r}`" + ("　⚠使われません（登録できない語です）" if validate_dict_word(w) else "")
-        for w, r in sorted(m.items())
-    )
-    if len(text) > 1900:
-        text = text[:1900] + "\n…"
-    await interaction.response.send_message(text, ephemeral=True)
+@bot.tree.command(name="settings", description="設定画面（声・速度・試し聞き・辞書・サーバー設定）")
+@app_commands.describe(tab="最初に開く画面")
+@app_commands.choices(tab=[
+    app_commands.Choice(name="自分の声", value="me"),
+    app_commands.Choice(name="辞書", value="dict"),
+    app_commands.Choice(name="サーバー設定", value="server"),
+    app_commands.Choice(name="BOT（表示・再起動。BOTオーナーのみ）", value="bot"),
+])
+async def settings_cmd(interaction: discord.Interaction, tab: Optional[str] = None):
+    await open_settings(interaction, tab or "me")
 
 
 @bot.tree.command(name="status", description="BOTの状態（エンジン・接続数）")
@@ -2272,52 +3037,72 @@ async def status_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-@bot.tree.command(name="credit", description="利用エンジンのクレジット・規約に関する案内")
+CREDIT_URL = cfg_str("bot", "credit_url")   # クレジットのページ（空なら出さない）
+# VOICEVOX で、キャラクター名と別の表記が決められているもの（各キャラクターの利用規約より）
+VOICEVOX_CREDIT_NAMES = {
+    "もち子さん": "もち子(cv 明日葉よもぎ)",
+    "Voidoll": "Voidoll(CV:丹下桜)",
+    "ユーレイちゃん": "ユーレイちゃん(CV:神崎零)",
+    "里石ユカ": "里石ユカ（つぼみ）",
+}
+
+
+def _character_name(label: str) -> str:
+    """「ずんだもん（ノーマル）」→「ずんだもん」（話し方の違いを1つにまとめる）"""
+    # 話し方の名前にも（）が入ることがあるので（例: 後鬼（人間（怒り）ver.））、最初の「（」で切る
+    if label.endswith("）") and "（" in label and not label.startswith("（"):
+        return label[:label.index("（")]
+    return label
+
+
+def credit_lines() -> list[str]:
+    """いま動いているエンジンと話者から、クレジットの一覧を作る"""
+    lines = []
+    for key in ENGINE_ORDER:
+        eng = engines.get(key)
+        if eng is None or not eng.voices:
+            continue
+        names = list(dict.fromkeys(_character_name(v.label) for v in eng.voices))
+        if key == "voicevox":
+            body = "、".join(f"VOICEVOX:{VOICEVOX_CREDIT_NAMES.get(n, n)}" for n in names)
+        else:
+            body = "、".join(names)
+        lines.append(f"**{eng.display_name}**\n{body}")
+    return lines
+
+
+@bot.tree.command(name="credit", description="使っている音声のクレジット（キャラクター名・利用規約）")
 async def credit_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "各音声エンジン・キャラクターには利用規約があります。\n"
-        "特にVOICEVOXは、音声を公開・配信する際に「VOICEVOX:キャラクター名」のクレジット表記が必要です。\n"
-        "公開サーバーで使う場合は、各エンジンの規約を確認してください。",
-        ephemeral=True,
-    )
+    parts = ["🎙 **この読み上げBOTで使っている音声**"]
+    parts += credit_lines() or ["（いま動いている音声エンジンがありません）"]
+    tail = "各キャラクターの利用規約に従って利用しています。"
+    if CREDIT_URL:
+        tail += f"\n表記のしかた・利用規約の一覧: {CREDIT_URL}"
+    text = "\n\n".join(parts)
+    if len(text) + len(tail) > 1950:
+        text = text[:1950 - len(tail)] + "…"
+    await interaction.response.send_message(f"{text}\n\n{tail}", ephemeral=True)
 
 
-OWNER_ONLY_COMMANDS = {"restart", "presence"}
+async def request_restart(user_id: int):
+    """再起動する（BOTオーナーだけ。設定画面の 🤖 BOT タブから）"""
+    global RESTART_REQUESTED
+    log.info("[RESTART] %s", user_id)
+    RESTART_REQUESTED = True
+    await bot.close()   # エンジンの後始末は TTSBot.close が行う
 
 
-@bot.tree.command(name="presence", description="BOTのステータスと「プレイ中」表示を変更（管理者のみ）")
-@app_commands.describe(
-    status="オンライン状態",
-    activity="表示する文字（例: /join で読み上げ）。指定すると自動表示はオフになります",
-    kind="表示の種類（「表示を消す」でプレイ中を消去）",
-    auto="自動表示（「〇サーバーで読み上げ中」）のオン/オフ",
-)
-@app_commands.choices(
-    status=[app_commands.Choice(name=label, value=key) for key, label in STATUS_LABELS.items()],
-    kind=[app_commands.Choice(name=f"{label}（{key}）", value=key) for key, label in ACTIVITY_LABELS.items()]
-    + [app_commands.Choice(name="表示を消す", value="none")],
-)
-async def presence_cmd(
-    interaction: discord.Interaction,
-    status: Optional[str] = None,
-    activity: Optional[str] = None,
-    kind: Optional[str] = None,
-    auto: Optional[bool] = None,
-):
-    if not is_owner(interaction.user.id):
-        await interaction.response.send_message("権限がありません", ephemeral=True)
-        return
+def describe_presence() -> str:
+    st, kd, tx = effective_presence()
+    shown = f"{tx}（{ACTIVITY_LABELS[kd]}）" if tx else "なし"
+    mode = "自動表示" if presence_auto() else "手動"
+    return f"ステータス: **{STATUS_LABELS[st]}**\n表示: **{shown}**（{mode}）"
 
-    def describe() -> str:
-        st, kd, tx = effective_presence()
-        shown = f"{tx}（{ACTIVITY_LABELS[kd]}）" if tx else "なし"
-        mode = "自動表示" if presence_auto() else "手動"
-        return f"ステータス: **{STATUS_LABELS[st]}**\n表示: **{shown}**（{mode}）"
 
-    if status is None and activity is None and kind is None and auto is None:
-        await interaction.response.send_message("**現在の設定**\n" + describe(), ephemeral=True)
-        return
-
+async def change_presence(status: Optional[str] = None, activity: Optional[str] = None,
+                          kind: Optional[str] = None, auto: Optional[bool] = None) -> Optional[str]:
+    """BOTのステータス・表示を変えて保存する（設定画面の 🤖 BOT タブから）。失敗したらエラー文を返す
+    kind="none" で表示を消す。文字を指定すると自動表示はオフになる"""
     cur_status, cur_kind, cur_text = stored_presence()
     new_status = status or cur_status
     new_kind = kind if kind and kind != "none" else cur_kind
@@ -2333,8 +3118,7 @@ async def presence_cmd(
         if auto is None:
             new_auto = False   # 文字を指定したなら、その文字を表示する
     elif kind is not None and not cur_text and not new_auto:
-        await interaction.response.send_message("表示する文字を `activity` に入力してください", ephemeral=True)
-        return
+        return "先に、表示する文字を入力してください"
 
     old = dict(presence_store.data)
     presence_store.data.update({"status": new_status, "kind": new_kind, "text": new_text, "auto": new_auto})
@@ -2344,31 +3128,15 @@ async def presence_cmd(
         log.exception("プレゼンス変更に失敗")
         presence_store.data.clear()
         presence_store.data.update(old)   # 反映できなかったので、保存する設定も元に戻す
-        await interaction.response.send_message("変更に失敗しました", ephemeral=True)
-        return
-
+        return "変更に失敗しました"
     presence_store.save()
-    await interaction.response.send_message("変更しました\n" + describe(), ephemeral=True)
-
-
-@bot.tree.command(name="restart", description="再起動（管理者のみ）")
-async def restart(interaction: discord.Interaction):
-    global RESTART_REQUESTED
-    if not is_owner(interaction.user.id):
-        await interaction.response.send_message("権限がありません", ephemeral=True)
-        return
-    await interaction.response.send_message("再起動します…")
-    log.info("[RESTART] %s", interaction.user.id)
-    RESTART_REQUESTED = True
-    await bot.close()   # エンジンの後始末は TTSBot.close が行う
+    return None
 
 
 @bot.tree.command(name="help_read", description="コマンド一覧")
 async def help_read(interaction: discord.Interaction):
-    lines = ["**コマンド**"]
+    lines = ["声・速度・辞書・サーバー設定・試し聞きは、すべて `/settings` からできます", "", "**コマンド**"]
     for c in sorted(bot.tree.get_commands(), key=lambda c: c.name):
-        if c.name in OWNER_ONLY_COMMANDS and not is_owner(interaction.user.id):
-            continue
         lines.append(f"`/{c.name}` … {c.description}")
     lines.append("\n`;` `//` `/` で始まる発言は読み上げません")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)

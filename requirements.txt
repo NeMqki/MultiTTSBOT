@@ -1,5 +1,5 @@
 # 必須
-discord.py[voice]
+discord.py[voice]>=2.6   # 設定画面のポップアップ（中にプルダウン）に 2.6 以上が必要
 requests
 
 # 使うエンジンに応じて（Windows）
